@@ -1,0 +1,61 @@
+name: Build and Release VitaMail
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-host:
+    name: Host Protocol Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch mbedTLS v2.28.9
+        run: git clone --depth 1 --branch v2.28.9 https://github.com/Mbed-TLS/mbedtls.git third_party/mbedtls
+
+      - name: Build and run unit tests
+        run: |
+          cmake -S . -B build_host -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build_host -j
+          ctest --test-dir build_host --output-on-failure
+
+  build-vpk:
+    name: Build PS Vita VPK
+    needs: test-host
+    runs-on: ubuntu-latest
+    container:
+      image: vitasdk/vitasdk:latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch mbedTLS v2.28.9
+        run: git clone --depth 1 --branch v2.28.9 https://github.com/Mbed-TLS/mbedtls.git third_party/mbedtls
+
+      - name: Install VitaSDK dependencies
+        run: vdpm install sdl2 freetype libpng zlib bzip2
+
+      - name: Build VitaMail.vpk
+        run: |
+          cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: Upload VPK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaMail-vpk
+          path: build/VitaMail.vpk
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/VitaMail.vpk
+          generate_release_notes: true
