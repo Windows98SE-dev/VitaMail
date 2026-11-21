@@ -1,0 +1,9 @@
+build/
+build_host/
+third_party/
+vitamail_accounts.cfg
+*.vpk
+*.self
+*.velf
+.agents
+skills-lock.json
