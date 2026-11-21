@@ -110,11 +110,13 @@ static struct {
 	/* Attachment preview modal */
 	SDL_Renderer *ren;
 	int show_att_preview;
-	int att_preview_idx;
+	int att_preview_idx; /* >= 0: open_msg.attachments[idx], -1: Compose cmp_att_path */
 	SDL_Texture *att_tex;
 	int att_img_w;
 	int att_img_h;
 	int att_text_scroll;
+	unsigned char *att_disk_data;
+	size_t att_disk_size;
 
 	/* Compose state */
 	char cmp_to[256];
@@ -719,6 +721,8 @@ static void activate_settings_field(int idx)
 	}
 }
 
+static void open_compose_attachment_preview(void);
+
 static void activate_compose_field(int idx)
 {
 	switch (idx) {
@@ -733,9 +737,7 @@ static void activate_compose_field(int idx)
 		break;
 	case 3:
 		if (g_app.cmp_att_path[0] != '\0') {
-			g_app.cmp_att_path[0] = '\0';
-			g_app.cmp_att_name[0] = '\0';
-			g_app.cmp_att_size = 0;
+			open_compose_attachment_preview();
 		} else {
 #ifdef __vita__
 			fp_load_dir("ux0:picture/");
@@ -764,27 +766,23 @@ static void close_attachment_preview(void)
 		SDL_DestroyTexture(g_app.att_tex);
 		g_app.att_tex = NULL;
 	}
+	free(g_app.att_disk_data);
+	g_app.att_disk_data = NULL;
+	g_app.att_disk_size = 0;
 	g_app.att_img_w = 0;
 	g_app.att_img_h = 0;
 	g_app.att_text_scroll = 0;
 	g_app.show_att_preview = 0;
 }
 
-static void open_attachment_preview(int idx)
+static void decode_preview_texture(const char *filename, const char *mime_type,
+                                   const unsigned char *data, size_t size)
 {
-	if (idx < 0 || idx >= g_app.open_msg.attachment_count)
-		return;
-	close_attachment_preview();
-
-	const MimeAttachment *att = &g_app.open_msg.attachments[idx];
-	g_app.att_preview_idx = idx;
-	g_app.show_att_preview = 1;
-
-	if (att->data && att->size > 0 && img_is_supported(att->filename, att->mime_type) && g_app.ren) {
+	if (data && size > 0 && img_is_supported(filename, mime_type) && g_app.ren) {
 		int w = 0, h = 0;
-		uint8_t *rgba = img_decode_memory(att->data, att->size, &w, &h);
+		uint8_t *rgba = img_decode_memory(data, size, &w, &h);
 		if (rgba) {
-			SDL_Texture *tex = SDL_CreateTexture(g_app.ren, SDL_PIXELFORMAT_RGBA8888,
+			SDL_Texture *tex = SDL_CreateTexture(g_app.ren, SDL_PIXELFORMAT_RGBA32,
 			                                     SDL_TEXTUREACCESS_STATIC, w, h);
 			if (tex) {
 				SDL_UpdateTexture(tex, NULL, rgba, w * 4);
@@ -796,6 +794,37 @@ static void open_attachment_preview(int idx)
 			free(rgba);
 		}
 	}
+}
+
+static void open_attachment_preview(int idx)
+{
+	if (idx < 0 || idx >= g_app.open_msg.attachment_count)
+		return;
+	close_attachment_preview();
+
+	const MimeAttachment *att = &g_app.open_msg.attachments[idx];
+	g_app.att_preview_idx = idx;
+	g_app.show_att_preview = 1;
+	decode_preview_texture(att->filename, att->mime_type, att->data, att->size);
+}
+
+static void open_compose_attachment_preview(void)
+{
+	if (g_app.cmp_att_path[0] == '\0')
+		return;
+	close_attachment_preview();
+
+	unsigned char *data = NULL;
+	size_t len = 0;
+	if (read_attachment_file(g_app.cmp_att_path, &data, &len) != 0) {
+		set_status("Failed to read attachment for preview.", 1);
+		return;
+	}
+	g_app.att_preview_idx = -1;
+	g_app.att_disk_data = data;
+	g_app.att_disk_size = len;
+	g_app.show_att_preview = 1;
+	decode_preview_texture(g_app.cmp_att_name, NULL, data, len);
 }
 
 static void save_attachment_to_disk(int idx)
@@ -854,6 +883,7 @@ int app_init(SDL_Renderer *ren)
 void app_shutdown(void)
 {
 	close_attachment_preview();
+	html_view_clear_cache();
 	if (g_app.worker) {
 		SDL_WaitThread(g_app.worker, NULL);
 		g_app.worker = NULL;
@@ -914,6 +944,8 @@ static void handle_button_back(void)
 		return;
 	}
 	if (g_app.screen == SCREEN_READER || g_app.screen == SCREEN_COMPOSE || g_app.screen == SCREEN_SETTINGS) {
+		if (g_app.screen == SCREEN_READER)
+			html_view_clear_cache();
 		g_app.screen = SCREEN_INBOX;
 	}
 }
@@ -989,10 +1021,16 @@ static void handle_touch_tap(int x, int y)
 	}
 
 	if (g_app.show_att_preview) {
-		if (ui_point_in_rect(x, y, (UiRect){ 260, 444, 220, 36 })) {
-			save_attachment_to_disk(g_app.att_preview_idx);
-		} else if (ui_point_in_rect(x, y, (UiRect){ 500, 444, 160, 36 })) {
-			close_attachment_preview();
+		if (g_app.att_preview_idx >= 0) {
+			if (ui_point_in_rect(x, y, (UiRect){ 260, 444, 220, 36 })) {
+				save_attachment_to_disk(g_app.att_preview_idx);
+			} else if (ui_point_in_rect(x, y, (UiRect){ 500, 444, 160, 36 })) {
+				close_attachment_preview();
+			}
+		} else {
+			if (ui_point_in_rect(x, y, (UiRect){ 400, 444, 160, 36 })) {
+				close_attachment_preview();
+			}
 		}
 		return;
 	}
@@ -1085,7 +1123,12 @@ static void handle_touch_tap(int x, int y)
 		if (ui_point_in_rect(x, y, (UiRect){ 40, 74, 880, 40 })) { g_app.cmp_focus = 0; activate_compose_field(0); }
 		else if (ui_point_in_rect(x, y, (UiRect){ 40, 126, 880, 40 })) { g_app.cmp_focus = 1; activate_compose_field(1); }
 		else if (ui_point_in_rect(x, y, (UiRect){ 40, 178, 880, 270 })) { g_app.cmp_focus = 2; activate_compose_field(2); }
-		else if (ui_point_in_rect(x, y, (UiRect){ 40, 468, 340, 42 })) { g_app.cmp_focus = 3; activate_compose_field(3); }
+		else if (g_app.cmp_att_name[0] != '\0' && ui_point_in_rect(x, y, (UiRect){ 340, 468, 42, 42 })) {
+			g_app.cmp_att_path[0] = '\0';
+			g_app.cmp_att_name[0] = '\0';
+			g_app.cmp_att_size = 0;
+		}
+		else if (ui_point_in_rect(x, y, (UiRect){ 40, 468, g_app.cmp_att_name[0] ? 294 : 340, 42 })) { g_app.cmp_focus = 3; activate_compose_field(3); }
 		else if (ui_point_in_rect(x, y, (UiRect){ 400, 468, 180, 42 })) { g_app.cmp_focus = 4; activate_compose_field(4); }
 		else if (ui_point_in_rect(x, y, (UiRect){ 600, 468, 160, 42 })) { g_app.cmp_focus = 5; activate_compose_field(5); }
 	} else if (g_app.screen == SCREEN_SETTINGS) {
@@ -1377,10 +1420,11 @@ static void render_reader(void)
 		}
 	}
 
-	ui_fill_rect(16, 148, 928, 330, COL_PANEL_ALT);
+	int use_html = (g_app.reader_html_mode && g_app.open_msg.html_body && g_app.ren);
+	ui_fill_rect(16, 148, 928, 330, use_html ? (UiColor){ 255, 255, 255, 255 } : COL_PANEL_ALT);
 	ui_draw_rect(16, 148, 928, 330, COL_BORDER);
 
-	if (g_app.reader_html_mode && g_app.open_msg.html_body && g_app.ren) {
+	if (use_html) {
 		g_app.reader_total_h = html_view_render(g_app.ren, 28, 158, 904, 310,
 		                                        g_app.open_msg.html_body,
 		                                        &g_app.open_msg,
@@ -1421,14 +1465,15 @@ static void render_compose(void)
 	                     0);
 
 	char att_label[192];
-	if (g_app.cmp_att_name[0] != '\0')
-		snprintf(att_label, sizeof(att_label), "Clear: %.100s (%u KB)",
+	if (g_app.cmp_att_name[0] != '\0') {
+		snprintf(att_label, sizeof(att_label), "%.80s (%u KB)",
 		         g_app.cmp_att_name, (unsigned)((g_app.cmp_att_size + 1023) / 1024));
-	else
+		draw_button(40, 468, 294, 42, att_label, g_app.cmp_focus == 3, (UiColor){ 32, 62, 104, 255 });
+		draw_button(340, 468, 42, 42, "X", 0, (UiColor){ 120, 34, 46, 255 });
+	} else {
 		snprintf(att_label, sizeof(att_label), "Attach Picture / File...");
-
-	draw_button(40, 468, 340, 42, att_label, g_app.cmp_focus == 3,
-	            g_app.cmp_att_name[0] ? (UiColor){ 88, 62, 30, 255 } : COL_PANEL);
+		draw_button(40, 468, 340, 42, att_label, g_app.cmp_focus == 3, COL_PANEL);
+	}
 	draw_button(400, 468, 180, 42, "Send Email", g_app.cmp_focus == 4, (UiColor){ 36, 120, 82, 255 });
 	draw_button(600, 468, 160, 42, "Cancel [O]", g_app.cmp_focus == 5, COL_PANEL);
 }
@@ -1530,18 +1575,33 @@ static void render_tls_modal(void)
 
 static void render_att_preview(void)
 {
-	if (g_app.att_preview_idx < 0 || g_app.att_preview_idx >= g_app.open_msg.attachment_count)
+	const char *fname = NULL;
+	const char *mtype = "";
+	const unsigned char *data = NULL;
+	size_t size = 0;
+
+	if (g_app.att_preview_idx == -1) {
+		fname = g_app.cmp_att_name;
+		data = g_app.att_disk_data;
+		size = g_app.att_disk_size;
+	} else if (g_app.att_preview_idx >= 0 && g_app.att_preview_idx < g_app.open_msg.attachment_count) {
+		const MimeAttachment *att = &g_app.open_msg.attachments[g_app.att_preview_idx];
+		fname = att->filename;
+		mtype = att->mime_type;
+		data = att->data;
+		size = att->size;
+	} else {
 		return;
-	const MimeAttachment *att = &g_app.open_msg.attachments[g_app.att_preview_idx];
+	}
 
 	ui_fill_rect(0, 0, VITA_SCREEN_W, VITA_SCREEN_H, (UiColor){ 0, 0, 0, 190 });
 	ui_fill_rect(90, 50, 780, 444, COL_PANEL);
 	ui_draw_rect(90, 50, 780, 444, COL_ACCENT);
 
 	char hdr[256];
-	snprintf(hdr, sizeof(hdr), "%.120s  (%u KB  |  %s)",
-	         att->filename, (unsigned)((att->size + 1023) / 1024),
-	         att->mime_type[0] ? att->mime_type : "unknown");
+	snprintf(hdr, sizeof(hdr), "%.120s  (%u KB%s%s)",
+	         fname, (unsigned)((size + 1023) / 1024),
+	         mtype[0] ? "  |  " : "", mtype[0] ? mtype : "");
 	ui_draw_text(110, 64, 16, COL_TEXT, hdr, 740);
 
 	int box_x = 110, box_y = 96, box_w = 740, box_h = 334;
@@ -1557,11 +1617,12 @@ static void render_att_preview(void)
 		int dh = (int)((float)g_app.att_img_h * scale);
 		SDL_Rect dst = { box_x + (box_w - dw) / 2, box_y + (box_h - dh) / 2, dw, dh };
 		SDL_RenderCopy(g_app.ren, g_app.att_tex, NULL, &dst);
-	} else if (strncmp(att->mime_type, "text/", 5) == 0 && att->data && att->size > 0) {
-		size_t cap = (att->size < 32768) ? att->size : 32768;
+	} else if ((strncmp(mtype, "text/", 5) == 0 || strstr(fname, ".txt") || strstr(fname, ".log")) &&
+	           data && size > 0) {
+		size_t cap = (size < 32768) ? size : 32768;
 		char *txt = (char *)malloc(cap + 1);
 		if (txt) {
-			memcpy(txt, att->data, cap);
+			memcpy(txt, data, cap);
 			txt[cap] = '\0';
 			ui_draw_wrapped_text(box_x + 12, box_y + 10, box_w - 24, box_h - 20, 15,
 			                     COL_TEXT, txt, g_app.att_text_scroll);
@@ -1570,12 +1631,18 @@ static void render_att_preview(void)
 	} else {
 		ui_draw_text(box_x + 24, box_y + 130, 16, COL_MUTED,
 		             "Preview not available for this file type.", box_w - 48);
-		ui_draw_text(box_x + 24, box_y + 162, 14, COL_TEXT,
-		             "Press [Cross] or tap Save to export it to ux0:data/VitaMail/.", box_w - 48);
+		if (g_app.att_preview_idx >= 0) {
+			ui_draw_text(box_x + 24, box_y + 162, 14, COL_TEXT,
+			             "Press [Cross] or tap Save to export it to ux0:data/VitaMail/.", box_w - 48);
+		}
 	}
 
-	draw_button(260, 444, 220, 36, "[X] Save to VitaMail/", 1, (UiColor){ 36, 120, 82, 255 });
-	draw_button(500, 444, 160, 36, "[O] Close", 0, COL_PANEL_ALT);
+	if (g_app.att_preview_idx >= 0) {
+		draw_button(260, 444, 220, 36, "[X] Save to VitaMail/", 1, (UiColor){ 36, 120, 82, 255 });
+		draw_button(500, 444, 160, 36, "[O] Close", 0, COL_PANEL_ALT);
+	} else {
+		draw_button(400, 444, 160, 36, "[O] Close", 1, COL_PANEL_ALT);
+	}
 }
 
 void app_render(void)

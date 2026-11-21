@@ -49,6 +49,7 @@ if(VITA)
     src/ui.c
     src/ime.c
     src/html_view.c
+    src/http_img.c
     src/img_decode.c
     vita/vita_runtime.c
     ${VITAMAIL_CORE_SOURCES}

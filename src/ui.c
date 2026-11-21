@@ -120,8 +120,28 @@ static uint32_t next_utf8(const char **p)
 	return cp;
 }
 
+static int is_zero_width_cp(uint32_t cp)
+{
+	return (cp >= 0x200B && cp <= 0x200F) ||
+	       (cp >= 0x202A && cp <= 0x202E) ||
+	       (cp >= 0x2060 && cp <= 0x206F) ||
+	       (cp >= 0xFE00 && cp <= 0xFE0F) ||
+	       cp == 0x034F || cp == 0xFEFF || cp == 0x00AD;
+}
+
+static uint32_t normalize_space_cp(uint32_t cp)
+{
+	if (cp == 0x00A0 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x202F || cp == 0x205F || cp == 0x3000)
+		return ' ';
+	return cp;
+}
+
 static CachedGlyph *get_glyph(uint32_t cp, int size_px)
 {
+	if (is_zero_width_cp(cp))
+		return NULL;
+	cp = normalize_space_cp(cp);
+
 	g_ui.tick++;
 	int empty_idx = -1;
 	int lru_idx = 0;
