@@ -253,75 +253,25 @@ static void parse_header_fields_block(const char *hdr, size_t len, ImapHeader *h
 int imap_fetch_headers(ImapSession *sess, ImapHeader *out, int max_headers,
                        char *errbuf, size_t errlen)
 {
-	if (max_headers <= 0)
+	if (max_headers <= 0 || sess->total_exists == 0)
 		return 0;
 
-	/* 1. UID SEARCH ALL */
+	uint32_t end_seq = sess->total_exists;
+	uint32_t start_seq = (end_seq > (uint32_t)max_headers)
+	                         ? (end_seq - (uint32_t)max_headers + 1)
+	                         : 1;
+
+	/* Fetch newest messages by sequence range (works for any mailbox size) */
 	char tag[16], line[4096];
 	imap_next_tag(sess, tag, sizeof(tag));
-	if (net_tls_sendf(&sess->conn, errbuf, errlen, "%s UID SEARCH ALL\r\n", tag) != 0)
-		return -1;
-
-	uint32_t *all_uids = (uint32_t *)malloc(sizeof(uint32_t) * 4096);
-	if (!all_uids) {
-		snprintf(errbuf, errlen, "Out of memory");
-		return -1;
-	}
-	int total_uids = 0;
-	size_t taglen = strlen(tag);
-
-	while (1) {
-		if (net_tls_recv_line(&sess->conn, line, sizeof(line), errbuf, errlen) < 0) {
-			free(all_uids);
-			return -1;
-		}
-		if (strncmp(line, tag, taglen) == 0 && line[taglen] == ' ') {
-			if (strncmp(line + taglen + 1, "OK", 2) != 0) {
-				snprintf(errbuf, errlen, "IMAP UID SEARCH failed: %s", line + taglen + 1);
-				free(all_uids);
-				return -1;
-			}
-			break;
-		}
-		if (strncmp(line, "* SEARCH", 8) == 0) {
-			total_uids = imap_parse_search_uids(line, all_uids, 4096);
-		}
-	}
-
-	if (total_uids == 0) {
-		free(all_uids);
-		return 0;
-	}
-
-	/* Take up to max_headers newest UIDs (at the end of the list) */
-	int take = (total_uids < max_headers) ? total_uids : max_headers;
-	int start_idx = total_uids - take;
-
-	/* Build comma-separated UID set in reverse order? IMAP returns ascending, we reverse in out[] */
-	char *uid_set = (char *)malloc((size_t)take * 12 + 16);
-	if (!uid_set) {
-		free(all_uids);
-		return -1;
-	}
-	size_t uoff = 0;
-	for (int i = start_idx; i < total_uids; i++) {
-		uoff += (size_t)snprintf(uid_set + uoff, 16, "%s%u",
-		                         (i > start_idx) ? "," : "", all_uids[i]);
-	}
-	free(all_uids);
-
-	/* 2. UID FETCH <uid_set> (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)]) */
-	imap_next_tag(sess, tag, sizeof(tag));
 	if (net_tls_sendf(&sess->conn, errbuf, errlen,
-	                  "%s UID FETCH %s (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])\r\n",
-	                  tag, uid_set) != 0) {
-		free(uid_set);
+	                  "%s FETCH %u:%u (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])\r\n",
+	                  tag, start_seq, end_seq) != 0) {
 		return -1;
 	}
-	free(uid_set);
 
 	int count = 0;
-	taglen = strlen(tag);
+	size_t taglen = strlen(tag);
 	while (1) {
 		if (net_tls_recv_line(&sess->conn, line, sizeof(line), errbuf, errlen) < 0)
 			return -1;

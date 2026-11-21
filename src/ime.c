@@ -11,6 +11,7 @@
 #endif
 
 static int g_ime_active = 0;
+static int g_ime_multiline = 0;
 
 #ifdef __vita__
 static uint16_t g_title_u16[SCE_IME_DIALOG_MAX_TITLE_LENGTH + 1];
@@ -135,7 +136,10 @@ int ime_start(const char *title_utf8, const char *initial_utf8,
 
 	param.supportedLanguages = 0;
 	param.languagesForced = SCE_FALSE;
-	param.dialogMode = SCE_IME_DIALOG_DIALOG_MODE_WITH_CANCEL;
+	g_ime_multiline = (kind == IME_KIND_MULTILINE) ? 1 : 0;
+	param.dialogMode = g_ime_multiline
+	                       ? SCE_IME_DIALOG_DIALOG_MODE_DEFAULT
+	                       : SCE_IME_DIALOG_DIALOG_MODE_WITH_CANCEL;
 	param.textBoxMode = (kind == IME_KIND_PASSWORD)
 	                        ? SCE_IME_DIALOG_TEXTBOX_MODE_PASSWORD
 	                        : SCE_IME_DIALOG_TEXTBOX_MODE_DEFAULT;
@@ -191,7 +195,8 @@ ImePollResult ime_poll(char *out_utf8, size_t out_cap)
 		sceImeDialogTerm();
 		g_ime_active = 0;
 
-		if (res.button == SCE_IME_DIALOG_BUTTON_ENTER) {
+		if (res.button == SCE_IME_DIALOG_BUTTON_ENTER ||
+		    (g_ime_multiline && res.button == SCE_IME_DIALOG_BUTTON_CLOSE)) {
 			utf16_to_utf8(g_input_u16, out_utf8, out_cap);
 			return IME_POLL_CONFIRMED;
 		}

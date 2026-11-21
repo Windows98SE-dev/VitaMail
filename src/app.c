@@ -13,7 +13,12 @@
 
 #ifdef __vita__
 #include <psp2/ctrl.h>
+#include <psp2/io/dirent.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
+#else
+#include <dirent.h>
 #endif
 
 typedef enum ScreenMode {
@@ -22,6 +27,23 @@ typedef enum ScreenMode {
 	SCREEN_COMPOSE,
 	SCREEN_SETTINGS
 } ScreenMode;
+
+typedef enum SortMode {
+	SORT_NEWEST = 0,
+	SORT_OLDEST,
+	SORT_SENDER,
+	SORT_SUBJECT,
+	SORT_UNREAD,
+	SORT_COUNT
+} SortMode;
+
+#define FP_MAX_ENTRIES 128
+
+typedef struct FileEntry {
+	char name[128];
+	int is_dir;
+	uint32_t size;
+} FileEntry;
 
 typedef enum WorkerJobType {
 	JOB_NONE = 0,
@@ -74,6 +96,7 @@ static struct {
 	int header_count;
 	int selected_msg;
 	int list_scroll;
+	SortMode sort_mode;
 
 	MimeMessage open_msg;
 	uint32_t open_uid;
@@ -85,7 +108,18 @@ static struct {
 	char cmp_subject[256];
 	char cmp_body[4096];
 	char cmp_reply_id[256];
-	int cmp_focus; /* 0=To, 1=Subject, 2=Body, 3=Send, 4=Cancel */
+	char cmp_att_path[512];
+	char cmp_att_name[128];
+	uint32_t cmp_att_size;
+	int cmp_focus; /* 0=To, 1=Subject, 2=Body, 3=Attach, 4=Send, 5=Cancel */
+
+	/* File picker modal */
+	int show_file_picker;
+	char fp_dir[512];
+	FileEntry fp_entries[FP_MAX_ENTRIES];
+	int fp_count;
+	int fp_sel;
+	int fp_scroll;
 
 	/* Settings state */
 	int set_focus; /* 0=Preset, 1=Email, 2=Pass, 3=ImapHost, 4=ImapPort, 5=ImapTLS,
@@ -118,6 +152,115 @@ static void set_status(const char *msg, int is_err)
 	SDL_UnlockMutex(g_app.lock);
 }
 
+static const char *sort_mode_label(SortMode m)
+{
+	switch (m) {
+	case SORT_NEWEST:  return "Sort: Newest";
+	case SORT_OLDEST:  return "Sort: Oldest";
+	case SORT_SENDER:  return "Sort: Sender";
+	case SORT_SUBJECT: return "Sort: Subject";
+	case SORT_UNREAD:  return "Sort: Unread";
+	default:           return "Sort: Newest";
+	}
+}
+
+static int ci_cmp(const char *a, const char *b)
+{
+	for (;; a++, b++) {
+		int ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : (unsigned char)*a;
+		int cb = (*b >= 'A' && *b <= 'Z') ? (*b + 32) : (unsigned char)*b;
+		if (ca != cb)
+			return ca - cb;
+		if (ca == 0)
+			return 0;
+	}
+}
+
+static int cmp_header(const void *pa, const void *pb)
+{
+	const ImapHeader *a = (const ImapHeader *)pa;
+	const ImapHeader *b = (const ImapHeader *)pb;
+	switch (g_app.sort_mode) {
+	case SORT_OLDEST:
+		return (a->uid > b->uid) - (a->uid < b->uid);
+	case SORT_SENDER: {
+		int c = ci_cmp(a->from, b->from);
+		return c != 0 ? c : ((b->uid > a->uid) - (b->uid < a->uid));
+	}
+	case SORT_SUBJECT: {
+		int c = ci_cmp(a->subject, b->subject);
+		return c != 0 ? c : ((b->uid > a->uid) - (b->uid < a->uid));
+	}
+	case SORT_UNREAD:
+		if (a->seen != b->seen)
+			return a->seen - b->seen; /* unseen (0) first */
+		return (b->uid > a->uid) - (b->uid < a->uid);
+	case SORT_NEWEST:
+	default:
+		return (b->uid > a->uid) - (b->uid < a->uid);
+	}
+}
+
+static void sort_headers_locked(void)
+{
+	if (g_app.header_count > 1)
+		qsort(g_app.headers, (size_t)g_app.header_count, sizeof(ImapHeader), cmp_header);
+	g_app.selected_msg = 0;
+	g_app.list_scroll = 0;
+}
+
+static int read_attachment_file(const char *path, unsigned char **out_data, size_t *out_len)
+{
+#ifdef __vita__
+	SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+	if (fd < 0)
+		return -1;
+	SceOff sz = sceIoLseek(fd, 0, SCE_SEEK_END);
+	if (sz <= 0 || sz > 8 * 1024 * 1024) {
+		sceIoClose(fd);
+		return -1;
+	}
+	sceIoLseek(fd, 0, SCE_SEEK_SET);
+	unsigned char *buf = (unsigned char *)malloc((size_t)sz);
+	if (!buf) {
+		sceIoClose(fd);
+		return -1;
+	}
+	size_t total = 0;
+	while (total < (size_t)sz) {
+		int r = sceIoRead(fd, buf + total, (SceSize)((size_t)sz - total));
+		if (r <= 0)
+			break;
+		total += (size_t)r;
+	}
+	sceIoClose(fd);
+	*out_data = buf;
+	*out_len = total;
+	return 0;
+#else
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return -1;
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	if (sz <= 0 || sz > 8 * 1024 * 1024) {
+		fclose(f);
+		return -1;
+	}
+	fseek(f, 0, SEEK_SET);
+	unsigned char *buf = (unsigned char *)malloc((size_t)sz);
+	if (!buf) {
+		fclose(f);
+		return -1;
+	}
+	size_t n = fread(buf, 1, (size_t)sz, f);
+	fclose(f);
+	*out_data = buf;
+	*out_len = n;
+	return 0;
+#endif
+}
+
 static int worker_thread_fn(void *arg)
 {
 	(void)arg;
@@ -133,11 +276,19 @@ static int worker_thread_fn(void *arg)
 	char err[256] = {0};
 
 	if (job == JOB_SYNC_FOLDER) {
+		if (!net_tls_is_online()) {
+			set_status("Wi-Fi is offline. Connect your PS Vita to Wi-Fi in Settings.", 1);
+			goto done;
+		}
 		set_status("Connecting via TLS...", 0);
 		ImapSession sess;
 		if (imap_connect(&sess, cfg.imap_host, cfg.imap_port, cfg.imap_starttls,
 		                 cfg.email, cfg.password, err, sizeof(err)) != 0) {
-			set_status(err, 1);
+			if (strstr(err, "AUTHENTICATIONFAILED") != NULL || strstr(err, "Invalid credentials") != NULL) {
+				set_status("Login rejected! Gmail/iCloud/Yahoo require a 16-char App Password (see docs/PROVIDERS.md).", 1);
+			} else {
+				set_status(err, 1);
+			}
 			goto done;
 		}
 
@@ -171,8 +322,7 @@ static int worker_thread_fn(void *arg)
 		SDL_LockMutex(g_app.lock);
 		memcpy(g_app.headers, htmp, sizeof(ImapHeader) * (size_t)hc);
 		g_app.header_count = hc;
-		g_app.selected_msg = 0;
-		g_app.list_scroll = 0;
+		sort_headers_locked();
 		snprintf(g_app.status_msg, sizeof(g_app.status_msg),
 		         "Synced %d messages in %s", hc, folder);
 		g_app.status_is_err = 0;
@@ -216,12 +366,23 @@ static int worker_thread_fn(void *arg)
 	} else if (job == JOB_SEND_EMAIL) {
 		set_status("Sending via SMTP TLS...", 0);
 		SDL_LockMutex(g_app.lock);
-		char to[256], subj[256], body[4096], rep[256];
+		char to[256], subj[256], body[4096], rep[256], att_path[512], att_name[128];
 		snprintf(to, sizeof(to), "%s", g_app.cmp_to);
 		snprintf(subj, sizeof(subj), "%s", g_app.cmp_subject);
 		snprintf(body, sizeof(body), "%s", g_app.cmp_body);
 		snprintf(rep, sizeof(rep), "%s", g_app.cmp_reply_id);
+		snprintf(att_path, sizeof(att_path), "%s", g_app.cmp_att_path);
+		snprintf(att_name, sizeof(att_name), "%s", g_app.cmp_att_name);
 		SDL_UnlockMutex(g_app.lock);
+
+		unsigned char *att_data = NULL;
+		size_t att_len = 0;
+		if (att_path[0] != '\0') {
+			if (read_attachment_file(att_path, &att_data, &att_len) != 0) {
+				set_status("Failed to read attachment (max 8 MiB).", 1);
+				goto done;
+			}
+		}
 
 		SmtpSendRequest req = {
 			.host = cfg.smtp_host,
@@ -233,9 +394,14 @@ static int worker_thread_fn(void *arg)
 			.to = to,
 			.subject = subj,
 			.body = body,
-			.in_reply_to = rep
+			.in_reply_to = rep,
+			.attachment_name = att_name[0] ? att_name : NULL,
+			.attachment_data = att_data,
+			.attachment_len = att_len
 		};
-		if (smtp_send_email(&req, err, sizeof(err)) != 0) {
+		int send_rc = smtp_send_email(&req, err, sizeof(err));
+		free(att_data);
+		if (send_rc != 0) {
 			set_status(err, 1);
 			goto done;
 		}
@@ -341,12 +507,121 @@ static void begin_ime(ImeTarget tgt, const char *title, const char *init_val,
 	}
 }
 
+static int cmp_file_entry(const void *pa, const void *pb)
+{
+	const FileEntry *a = (const FileEntry *)pa;
+	const FileEntry *b = (const FileEntry *)pb;
+	if (strcmp(a->name, "..") == 0) return -1;
+	if (strcmp(b->name, "..") == 0) return 1;
+	if (a->is_dir != b->is_dir)
+		return b->is_dir - a->is_dir;
+	return ci_cmp(a->name, b->name);
+}
+
+static void fp_load_dir(const char *dir)
+{
+	snprintf(g_app.fp_dir, sizeof(g_app.fp_dir), "%s", dir);
+	g_app.fp_count = 0;
+	g_app.fp_sel = 0;
+	g_app.fp_scroll = 0;
+
+	/* Add parent entry if not at drive root */
+	size_t dlen = strlen(dir);
+	if (dlen > 4 && strcmp(dir, "ux0:/") != 0 && strcmp(dir, "ux0:") != 0) {
+		snprintf(g_app.fp_entries[0].name, 128, "..");
+		g_app.fp_entries[0].is_dir = 1;
+		g_app.fp_entries[0].size = 0;
+		g_app.fp_count = 1;
+	}
+
+#ifdef __vita__
+	SceUID dfd = sceIoDopen(dir);
+	if (dfd >= 0) {
+		SceIoDirent ent;
+		memset(&ent, 0, sizeof(ent));
+		while (g_app.fp_count < FP_MAX_ENTRIES && sceIoDread(dfd, &ent) > 0) {
+			if (ent.d_name[0] == '.' && (ent.d_name[1] == '\0' ||
+			    (ent.d_name[1] == '.' && ent.d_name[2] == '\0'))) {
+				memset(&ent, 0, sizeof(ent));
+				continue;
+			}
+			FileEntry *fe = &g_app.fp_entries[g_app.fp_count++];
+			snprintf(fe->name, sizeof(fe->name), "%.127s", ent.d_name);
+			fe->is_dir = SCE_S_ISDIR(ent.d_stat.st_mode) ? 1 : 0;
+			fe->size = (uint32_t)ent.d_stat.st_size;
+			memset(&ent, 0, sizeof(ent));
+		}
+		sceIoDclose(dfd);
+	}
+#else
+	DIR *d = opendir(dir);
+	if (d) {
+		struct dirent *ent;
+		while (g_app.fp_count < FP_MAX_ENTRIES && (ent = readdir(d)) != NULL) {
+			if (ent->d_name[0] == '.')
+				continue;
+			FileEntry *fe = &g_app.fp_entries[g_app.fp_count++];
+			snprintf(fe->name, sizeof(fe->name), "%.127s", ent->d_name);
+			fe->is_dir = (ent->d_type == DT_DIR) ? 1 : 0;
+			fe->size = 0;
+		}
+		closedir(d);
+	}
+#endif
+	if (g_app.fp_count > 1)
+		qsort(g_app.fp_entries, (size_t)g_app.fp_count, sizeof(FileEntry), cmp_file_entry);
+}
+
+static void fp_activate_selected(void)
+{
+	if (g_app.fp_count == 0 || g_app.fp_sel < 0 || g_app.fp_sel >= g_app.fp_count)
+		return;
+	FileEntry *fe = &g_app.fp_entries[g_app.fp_sel];
+	if (strcmp(fe->name, "..") == 0) {
+		char tmp[512];
+		snprintf(tmp, sizeof(tmp), "%s", g_app.fp_dir);
+		size_t n = strlen(tmp);
+		if (n > 0 && tmp[n - 1] == '/')
+			tmp[--n] = '\0';
+		char *sl = strrchr(tmp, '/');
+		if (sl) {
+			sl[1] = '\0';
+			fp_load_dir(tmp);
+		} else {
+			fp_load_dir("ux0:/");
+		}
+		return;
+	}
+	char full[512];
+	size_t dl = strlen(g_app.fp_dir);
+	if (dl > 0 && g_app.fp_dir[dl - 1] == '/')
+		snprintf(full, sizeof(full), "%.380s%.127s", g_app.fp_dir, fe->name);
+	else
+		snprintf(full, sizeof(full), "%.380s/%.127s", g_app.fp_dir, fe->name);
+
+	if (fe->is_dir) {
+		fp_load_dir(full);
+	} else {
+		if (fe->size > 8 * 1024 * 1024) {
+			set_status("File too large (max 8 MiB).", 1);
+			return;
+		}
+		snprintf(g_app.cmp_att_path, sizeof(g_app.cmp_att_path), "%s", full);
+		snprintf(g_app.cmp_att_name, sizeof(g_app.cmp_att_name), "%s", fe->name);
+		g_app.cmp_att_size = fe->size;
+		g_app.show_file_picker = 0;
+	}
+}
+
 static void open_compose_new(void)
 {
 	memset(g_app.cmp_to, 0, sizeof(g_app.cmp_to));
 	memset(g_app.cmp_subject, 0, sizeof(g_app.cmp_subject));
 	memset(g_app.cmp_body, 0, sizeof(g_app.cmp_body));
 	memset(g_app.cmp_reply_id, 0, sizeof(g_app.cmp_reply_id));
+	memset(g_app.cmp_att_path, 0, sizeof(g_app.cmp_att_path));
+	memset(g_app.cmp_att_name, 0, sizeof(g_app.cmp_att_name));
+	g_app.cmp_att_size = 0;
 	g_app.cmp_focus = 0;
 	g_app.screen = SCREEN_COMPOSE;
 }
@@ -374,6 +649,9 @@ static void open_compose_reply(void)
 	} else {
 		snprintf(g_app.cmp_subject, sizeof(g_app.cmp_subject), "Re: %s", g_app.open_msg.subject);
 	}
+	memset(g_app.cmp_att_path, 0, sizeof(g_app.cmp_att_path));
+	memset(g_app.cmp_att_name, 0, sizeof(g_app.cmp_att_name));
+	g_app.cmp_att_size = 0;
 	snprintf(g_app.cmp_reply_id, sizeof(g_app.cmp_reply_id), "%s", g_app.open_msg.message_id);
 	g_app.cmp_focus = 2; /* Focus body */
 	g_app.screen = SCREEN_COMPOSE;
@@ -441,13 +719,27 @@ static void activate_compose_field(int idx)
 		begin_ime(IME_TGT_CMP_BODY, "Message Body", g_app.cmp_body, IME_KIND_MULTILINE, 2000);
 		break;
 	case 3:
+		if (g_app.cmp_att_path[0] != '\0') {
+			g_app.cmp_att_path[0] = '\0';
+			g_app.cmp_att_name[0] = '\0';
+			g_app.cmp_att_size = 0;
+		} else {
+#ifdef __vita__
+			fp_load_dir("ux0:picture/");
+#else
+			fp_load_dir(".");
+#endif
+			g_app.show_file_picker = 1;
+		}
+		break;
+	case 4:
 		if (g_app.cmp_to[0] == '\0') {
 			set_status("Recipient (To) is required", 1);
 		} else {
 			start_job(JOB_SEND_EMAIL, 0, 0);
 		}
 		break;
-	case 4:
+	case 5:
 		g_app.screen = SCREEN_INBOX;
 		break;
 	}
@@ -501,6 +793,10 @@ static void handle_button_confirm(void)
 		net_tls_reload_ca(NULL);
 		return;
 	}
+	if (g_app.show_file_picker) {
+		fp_activate_selected();
+		return;
+	}
 	if (g_app.screen == SCREEN_INBOX) {
 		if (!g_app.busy && g_app.header_count > 0) {
 			uint32_t uid = g_app.headers[g_app.selected_msg].uid;
@@ -522,6 +818,10 @@ static void handle_button_back(void)
 		g_app.show_tls_modal = 0;
 		return;
 	}
+	if (g_app.show_file_picker) {
+		g_app.show_file_picker = 0;
+		return;
+	}
 	if (g_app.screen == SCREEN_READER || g_app.screen == SCREEN_COMPOSE || g_app.screen == SCREEN_SETTINGS) {
 		g_app.screen = SCREEN_INBOX;
 	}
@@ -531,6 +831,17 @@ static void handle_nav(int dy, int dx)
 {
 	if (g_app.show_tls_modal)
 		return;
+
+	if (g_app.show_file_picker) {
+		if (dy != 0 && g_app.fp_count > 0) {
+			g_app.fp_sel += dy;
+			if (g_app.fp_sel < 0) g_app.fp_sel = 0;
+			if (g_app.fp_sel >= g_app.fp_count) g_app.fp_sel = g_app.fp_count - 1;
+			if (g_app.fp_sel < g_app.fp_scroll) g_app.fp_scroll = g_app.fp_sel;
+			if (g_app.fp_sel >= g_app.fp_scroll + 8) g_app.fp_scroll = g_app.fp_sel - 7;
+		}
+		return;
+	}
 
 	if (g_app.screen == SCREEN_INBOX) {
 		if (dy != 0 && g_app.header_count > 0) {
@@ -552,7 +863,7 @@ static void handle_nav(int dy, int dx)
 		if (g_app.reader_scroll < 0)
 			g_app.reader_scroll = 0;
 	} else if (g_app.screen == SCREEN_COMPOSE) {
-		g_app.cmp_focus = (g_app.cmp_focus + dy + 5) % 5;
+		g_app.cmp_focus = (g_app.cmp_focus + dy + 6) % 6;
 	} else if (g_app.screen == SCREEN_SETTINGS) {
 		g_app.set_focus = (g_app.set_focus + dy + 11) % 11;
 	}
@@ -578,21 +889,47 @@ static void handle_touch_tap(int x, int y)
 		return;
 	}
 
+	if (g_app.show_file_picker) {
+		/* Quick-jump tabs */
+		if (ui_point_in_rect(x, y, (UiRect){ 120, 102, 130, 30 })) { fp_load_dir("ux0:picture/"); return; }
+		if (ui_point_in_rect(x, y, (UiRect){ 260, 102, 160, 30 })) { fp_load_dir("ux0:data/VitaMail/"); return; }
+		if (ui_point_in_rect(x, y, (UiRect){ 430, 102, 110, 30 })) { fp_load_dir("ux0:data/"); return; }
+		if (ui_point_in_rect(x, y, (UiRect){ 550, 102, 90, 30 }))  { fp_load_dir("ux0:/"); return; }
+		if (ui_point_in_rect(x, y, (UiRect){ 720, 444, 120, 34 })) { g_app.show_file_picker = 0; return; }
+		for (int row = 0; row < 8; row++) {
+			int idx = g_app.fp_scroll + row;
+			if (idx >= g_app.fp_count) break;
+			if (ui_point_in_rect(x, y, (UiRect){ 120, 144 + row * 36, 720, 32 })) {
+				g_app.fp_sel = idx;
+				fp_activate_selected();
+				return;
+			}
+		}
+		return;
+	}
+
 	if (g_app.screen == SCREEN_INBOX) {
-		/* Sidebar Compose & Settings buttons */
-		if (ui_point_in_rect(x, y, (UiRect){ 14, 56, 182, 36 })) {
+		/* Sidebar Compose, Settings, and Sort buttons */
+		if (ui_point_in_rect(x, y, (UiRect){ 14, 56, 182, 34 })) {
 			open_compose_new();
 			return;
 		}
-		if (ui_point_in_rect(x, y, (UiRect){ 14, 100, 182, 36 })) {
+		if (ui_point_in_rect(x, y, (UiRect){ 14, 96, 182, 34 })) {
 			g_app.edit_cfg = g_app.cfg;
 			g_app.set_focus = 0;
 			g_app.screen = SCREEN_SETTINGS;
 			return;
 		}
+		if (ui_point_in_rect(x, y, (UiRect){ 14, 136, 182, 34 })) {
+			SDL_LockMutex(g_app.lock);
+			g_app.sort_mode = (SortMode)((g_app.sort_mode + 1) % SORT_COUNT);
+			sort_headers_locked();
+			SDL_UnlockMutex(g_app.lock);
+			return;
+		}
 		/* Folder items */
 		for (int i = 0; i < g_app.folder_count && i < 8; i++) {
-			UiRect fr = { 14, 158 + i * 38, 182, 34 };
+			UiRect fr = { 14, 196 + i * 36, 182, 32 };
 			if (ui_point_in_rect(x, y, fr) && !g_app.busy) {
 				g_app.selected_folder = i;
 				start_job(JOB_SYNC_FOLDER, 0, 0);
@@ -632,8 +969,9 @@ static void handle_touch_tap(int x, int y)
 		if (ui_point_in_rect(x, y, (UiRect){ 40, 74, 880, 40 })) { g_app.cmp_focus = 0; activate_compose_field(0); }
 		else if (ui_point_in_rect(x, y, (UiRect){ 40, 126, 880, 40 })) { g_app.cmp_focus = 1; activate_compose_field(1); }
 		else if (ui_point_in_rect(x, y, (UiRect){ 40, 178, 880, 270 })) { g_app.cmp_focus = 2; activate_compose_field(2); }
-		else if (ui_point_in_rect(x, y, (UiRect){ 40, 468, 180, 42 })) { g_app.cmp_focus = 3; activate_compose_field(3); }
-		else if (ui_point_in_rect(x, y, (UiRect){ 240, 468, 180, 42 })) { g_app.cmp_focus = 4; activate_compose_field(4); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 40, 468, 340, 42 })) { g_app.cmp_focus = 3; activate_compose_field(3); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 400, 468, 180, 42 })) { g_app.cmp_focus = 4; activate_compose_field(4); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 600, 468, 160, 42 })) { g_app.cmp_focus = 5; activate_compose_field(5); }
 	} else if (g_app.screen == SCREEN_SETTINGS) {
 		for (int i = 0; i < 9; i++) {
 			UiRect r = { 40, 62 + i * 42, 880, 36 };
@@ -659,13 +997,17 @@ void app_handle_event(const SDL_Event *ev)
 		return;
 
 	if (ev->type == SDL_FINGERDOWN) {
+		/* Only respond to direct front touchscreen; ignore indirect rear touchpad */
+		if (SDL_GetTouchDeviceType(ev->tfinger.touchId) != SDL_TOUCH_DEVICE_DIRECT)
+			return;
 		int tx = (int)(ev->tfinger.x * VITA_SCREEN_W);
 		int ty = (int)(ev->tfinger.y * VITA_SCREEN_H);
 		handle_touch_tap(tx, ty);
 		return;
 	}
 
-	if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+	if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT &&
+	    ev->button.which != SDL_TOUCH_MOUSEID) {
 		handle_touch_tap(ev->button.x, ev->button.y);
 		return;
 	}
@@ -823,23 +1165,39 @@ static void render_inbox(void)
 	ui_fill_rect(0, 44, 210, VITA_SCREEN_H - 44, COL_PANEL_ALT);
 	ui_fill_rect(209, 44, 1, VITA_SCREEN_H - 44, COL_BORDER);
 
-	draw_button(14, 56, 182, 36, "[Square] Compose", 0, (UiColor){ 36, 98, 176, 255 });
-	draw_button(14, 100, 182, 36, "[Start] Settings", 0, COL_PANEL);
+	draw_button(14, 56, 182, 34, "[Square] Compose", 0, (UiColor){ 36, 98, 176, 255 });
+	draw_button(14, 96, 182, 34, "[Start] Settings", 0, COL_PANEL);
+	draw_button(14, 136, 182, 34, sort_mode_label(g_app.sort_mode), 0, COL_PANEL);
 
-	ui_draw_text(14, 142, 13, COL_MUTED, "FOLDERS (L/R)", 182);
+	ui_draw_text(14, 178, 13, COL_MUTED, "FOLDERS (L/R)", 182);
 	for (int i = 0; i < g_app.folder_count && i < 8; i++) {
-		int y = 162 + i * 38;
+		int y = 196 + i * 36;
 		int sel = (i == g_app.selected_folder);
-		ui_fill_rect(14, y, 182, 34, sel ? COL_SEL : COL_PANEL);
-		ui_draw_rect(14, y, 182, 34, sel ? COL_ACCENT : COL_BORDER);
-		ui_draw_text(24, y + 9, 15, COL_TEXT, g_app.folders[i].name, 162);
+		ui_fill_rect(14, y, 182, 32, sel ? COL_SEL : COL_PANEL);
+		ui_draw_rect(14, y, 182, 32, sel ? COL_ACCENT : COL_BORDER);
+		ui_draw_text(24, y + 8, 15, COL_TEXT, g_app.folders[i].name, 162);
 	}
 
 	/* Email list */
 	if (g_app.header_count == 0) {
-		ui_draw_text(250, 220, 18, COL_MUTED,
-		             g_app.busy ? "Syncing mailbox..." : "No messages. Press [Triangle] to refresh.",
-		             650);
+		if (g_app.busy) {
+			ui_fill_rect(240, 170, 680, 120, COL_PANEL);
+			ui_draw_rect(240, 170, 680, 120, COL_ACCENT);
+			ui_draw_text(260, 195, 18, COL_TEXT, "Connecting & Syncing...", 640);
+			ui_draw_wrapped_text(260, 230, 640, 50, 15, COL_MUTED,
+			                     g_app.status_msg[0] ? g_app.status_msg : "Please wait...", 0);
+		} else if (g_app.status_is_err && g_app.status_msg[0] != '\0') {
+			ui_fill_rect(240, 150, 680, 180, (UiColor){ 52, 20, 28, 255 });
+			ui_draw_rect(240, 150, 680, 180, COL_RED);
+			ui_draw_text(260, 168, 18, COL_RED, "Connection Failed", 640);
+			ui_draw_wrapped_text(260, 202, 640, 84, 15, COL_TEXT, g_app.status_msg, 0);
+			ui_draw_text(260, 296, 14, COL_MUTED,
+			             "Press [Start] for Account Settings or [Triangle] to retry.", 640);
+		} else {
+			ui_draw_text(250, 220, 18, COL_MUTED,
+			             "No messages. Press [Triangle] to refresh or [Start] for Settings.",
+			             650);
+		}
 	} else {
 		for (int row = 0; row < 8; row++) {
 			int idx = g_app.list_scroll + row;
@@ -910,8 +1268,56 @@ static void render_compose(void)
 	                     g_app.cmp_body[0] ? g_app.cmp_body : "(Tap or press [Cross] to write message body...)",
 	                     0);
 
-	draw_button(40, 468, 180, 42, "Send Email", g_app.cmp_focus == 3, (UiColor){ 36, 120, 82, 255 });
-	draw_button(240, 468, 180, 42, "Cancel [O]", g_app.cmp_focus == 4, COL_PANEL);
+	char att_label[192];
+	if (g_app.cmp_att_name[0] != '\0')
+		snprintf(att_label, sizeof(att_label), "Clear: %.100s (%u KB)",
+		         g_app.cmp_att_name, (unsigned)((g_app.cmp_att_size + 1023) / 1024));
+	else
+		snprintf(att_label, sizeof(att_label), "Attach Picture / File...");
+
+	draw_button(40, 468, 340, 42, att_label, g_app.cmp_focus == 3,
+	            g_app.cmp_att_name[0] ? (UiColor){ 88, 62, 30, 255 } : COL_PANEL);
+	draw_button(400, 468, 180, 42, "Send Email", g_app.cmp_focus == 4, (UiColor){ 36, 120, 82, 255 });
+	draw_button(600, 468, 160, 42, "Cancel [O]", g_app.cmp_focus == 5, COL_PANEL);
+}
+
+static void render_file_picker(void)
+{
+	ui_fill_rect(0, 0, VITA_SCREEN_W, VITA_SCREEN_H, (UiColor){ 0, 0, 0, 180 });
+	ui_fill_rect(100, 56, 760, 434, COL_PANEL);
+	ui_draw_rect(100, 56, 760, 434, COL_ACCENT);
+
+	char title[600];
+	snprintf(title, sizeof(title), "Attach File: %.480s", g_app.fp_dir);
+	ui_draw_text(120, 68, 17, COL_TEXT, title, 720);
+
+	draw_button(120, 102, 130, 30, "ux0:picture", 0, COL_PANEL_ALT);
+	draw_button(260, 102, 160, 30, "ux0:data/VitaMail", 0, COL_PANEL_ALT);
+	draw_button(430, 102, 110, 30, "ux0:data", 0, COL_PANEL_ALT);
+	draw_button(550, 102, 90, 30, "ux0:/", 0, COL_PANEL_ALT);
+
+	if (g_app.fp_count == 0) {
+		ui_draw_text(140, 260, 16, COL_MUTED, "(Empty directory)", 680);
+	} else {
+		for (int row = 0; row < 8; row++) {
+			int idx = g_app.fp_scroll + row;
+			if (idx >= g_app.fp_count) break;
+			const FileEntry *fe = &g_app.fp_entries[idx];
+			int y = 144 + row * 36;
+			int sel = (idx == g_app.fp_sel);
+			ui_fill_rect(120, y, 720, 32, sel ? COL_SEL : COL_PANEL_ALT);
+			ui_draw_rect(120, y, 720, 32, sel ? COL_ACCENT : COL_BORDER);
+			char row_txt[180];
+			if (fe->is_dir)
+				snprintf(row_txt, sizeof(row_txt), "[DIR] %s", fe->name);
+			else
+				snprintf(row_txt, sizeof(row_txt), "%s (%u KB)", fe->name, (unsigned)((fe->size + 1023) / 1024));
+			ui_draw_text(132, y + 7, 15, fe->is_dir ? COL_ACCENT : COL_TEXT, row_txt, 696);
+		}
+	}
+
+	ui_draw_text(120, 450, 14, COL_MUTED, "Tap or [Cross] to open/attach (max 8 MiB)", 580);
+	draw_button(720, 444, 120, 34, "[O] Close", 0, COL_PANEL_ALT);
 }
 
 static void render_settings(void)
@@ -962,10 +1368,8 @@ static void render_tls_modal(void)
 	ui_draw_text(165, 220, 15, COL_TEXT, line, 630);
 
 	ui_draw_wrapped_text(165, 255, 630, 90, 14, COL_MUTED,
-	                     "VitaMail strictly verifies IMAP & SMTP TLS certificates against "
-	                     "vs0:/data/external/cert/CA_LIST.cer. If your Vita's certificate store "
-	                     "is missing or expired, install iTLS-Enso (v3.2.1+) and choose "
-	                     "\"Install the full iTLS package\" or \"Install the iTLS CA certs\".",
+	                     st.status_msg[0] ? st.status_msg
+	                                      : "VitaMail verifies TLS certificates against vs0:/data/external/cert/CA_LIST.cer (iTLS-Enso).",
 	                     0);
 
 	draw_button(290, 360, 180, 38, "[X] Re-check CA", 1, (UiColor){ 36, 98, 176, 255 });
@@ -993,4 +1397,6 @@ void app_render(void)
 
 	if (g_app.show_tls_modal)
 		render_tls_modal();
+	if (g_app.show_file_picker)
+		render_file_picker();
 }

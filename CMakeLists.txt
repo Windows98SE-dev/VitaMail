@@ -83,7 +83,8 @@ if(VITA)
     -pthread
   )
 
-  vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
+  # UNSAFE is required so VitaMail can read the iTLS-Enso CA store at vs0:/data/external/cert/CA_LIST.cer
+  vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
   vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
     VERSION ${VITA_VERSION}
     NAME ${VITA_APP_NAME}

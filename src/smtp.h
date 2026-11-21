@@ -19,6 +19,9 @@ typedef struct SmtpSendRequest {
 	const char *subject;
 	const char *body;
 	const char *in_reply_to; /* optional Message-ID */
+	const char *attachment_name; /* optional filename */
+	const unsigned char *attachment_data; /* optional raw bytes */
+	size_t attachment_len;
 } SmtpSendRequest;
 
 /* Connect, authenticate, and send an email via SMTP. Returns 0 on success, -1 on error. */

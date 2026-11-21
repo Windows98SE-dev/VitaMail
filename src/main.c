@@ -28,6 +28,7 @@ int main(int argc, char *argv[])
 	memset(&app_init_param, 0, sizeof(app_init_param));
 	memset(&app_boot_param, 0, sizeof(app_boot_param));
 	sceAppUtilInit(&app_init_param, &app_boot_param);
+	SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
 #endif
 
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_EVENTS) != 0)

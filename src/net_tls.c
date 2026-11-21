@@ -66,14 +66,18 @@ int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t 
 #endif
 }
 
-static int read_entire_file(const char *path, char **out_buf, size_t *out_len)
+static int read_entire_file(const char *path, char **out_buf, size_t *out_len, int *out_err)
 {
+	if (out_err) *out_err = 0;
 #ifdef __vita__
 	SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-	if (fd < 0)
+	if (fd < 0) {
+		if (out_err) *out_err = fd;
 		return -1;
+	}
 	SceOff sz = sceIoLseek(fd, 0, SCE_SEEK_END);
 	if (sz <= 0 || sz > 4 * 1024 * 1024) {
+		if (out_err) *out_err = (int)sz;
 		sceIoClose(fd);
 		return -1;
 	}
@@ -97,8 +101,10 @@ static int read_entire_file(const char *path, char **out_buf, size_t *out_len)
 	return 0;
 #else
 	FILE *f = fopen(path, "rb");
-	if (!f)
+	if (!f) {
+		if (out_err) *out_err = errno;
 		return -1;
+	}
 	if (fseek(f, 0, SEEK_END) != 0) {
 		fclose(f);
 		return -1;
@@ -175,17 +181,38 @@ int net_tls_reload_ca(const char *ca_path_override)
 	mbedtls_x509_crt_init(&g_tls.cacert);
 	g_tls.ca_init = 1;
 
-	const char *path = ca_path_override ? ca_path_override : NET_TLS_CA_PATH_VITA;
-	snprintf(g_tls.status.ca_path, sizeof(g_tls.status.ca_path), "%s", path);
+	const char *candidates[] = {
+		ca_path_override ? ca_path_override : NET_TLS_CA_PATH_VITA,
+		"vs0:data/external/cert/CA_LIST.cer",
+		"ux0:data/VitaMail/CA_LIST.cer",
+		"ux0:data/VitaMail/ca_cert.pem"
+	};
+	int num_candidates = ca_path_override ? 1 : 4;
+
 	g_tls.status.ca_found = 0;
 	g_tls.status.ca_loaded_count = 0;
 	g_tls.status.ca_skipped_count = 0;
 
 	char *buf = NULL;
 	size_t len = 0;
-	if (read_entire_file(path, &buf, &len) != 0) {
+	int last_err = 0;
+	const char *used_path = candidates[0];
+
+	for (int i = 0; i < num_candidates; i++) {
+		int err = 0;
+		if (read_entire_file(candidates[i], &buf, &len, &err) == 0) {
+			used_path = candidates[i];
+			break;
+		}
+		last_err = err;
+	}
+
+	snprintf(g_tls.status.ca_path, sizeof(g_tls.status.ca_path), "%s", used_path);
+
+	if (!buf) {
 		snprintf(g_tls.status.status_msg, sizeof(g_tls.status.status_msg),
-		         "CA bundle not found at %s. Please install iTLS-Enso (CA certs).", path);
+		         "Cannot open %s (err 0x%08X). Install iTLS-Enso CA certs.",
+		         candidates[0], (unsigned int)last_err);
 		return -1;
 	}
 
@@ -199,12 +226,12 @@ int net_tls_reload_ca(const char *ca_path_override)
 
 	if (rc != 0 || loaded == 0) {
 		snprintf(g_tls.status.status_msg, sizeof(g_tls.status.status_msg),
-		         "CA bundle at %s contained 0 valid certificates.", path);
+		         "CA bundle at %s contained 0 valid certificates.", used_path);
 		return -1;
 	}
 
 	snprintf(g_tls.status.status_msg, sizeof(g_tls.status.status_msg),
-	         "Loaded %d CA certificates from %s (%d skipped).", loaded, path, skipped);
+	         "Loaded %d CA certificates from %s (%d skipped).", loaded, used_path, skipped);
 	return 0;
 }
 
