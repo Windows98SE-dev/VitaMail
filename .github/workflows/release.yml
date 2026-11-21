@@ -40,7 +40,7 @@ jobs:
         run: git clone --depth 1 --branch v2.28.9 https://github.com/Mbed-TLS/mbedtls.git third_party/mbedtls
 
       - name: Install VitaSDK dependencies
-        run: vdpm install sdl2 freetype libpng zlib bzip2
+        run: yes | vdpm install sdl2 freetype libpng zlib bzip2
 
       - name: Build VitaMail.vpk
         run: |
