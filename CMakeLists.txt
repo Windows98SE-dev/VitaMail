@@ -48,6 +48,8 @@ if(VITA)
     src/app.c
     src/ui.c
     src/ime.c
+    src/html_view.c
+    src/img_decode.c
     vita/vita_runtime.c
     ${VITAMAIL_CORE_SOURCES}
   )
@@ -76,6 +78,7 @@ if(VITA)
     SceRtc_stub
     SceIofilemgr_stub
     SceKernelDmacMgr_stub
+    turbojpeg
     png
     z
     bz2

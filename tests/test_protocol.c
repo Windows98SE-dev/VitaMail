@@ -61,7 +61,9 @@ static void test_rfc2047_and_mime_multipart(void)
 	assert(mime_parse_message(raw_mail, strlen(raw_mail), &msg) == 0);
 	assert(strcmp(msg.subject, "Test Subject") == 0);
 	assert(strcmp(msg.from, "Alice <alice@example.com>") == 0);
-	assert(strcmp(msg.attachments, "report.pdf") == 0);
+	assert(strcmp(msg.attachments_summary, "report.pdf") == 0);
+	assert(msg.attachment_count == 1);
+	assert(msg.html_body != NULL);
 	assert(strstr(msg.body, "Hello Vita!") != NULL);
 	assert(strstr(msg.body, "Line2") != NULL);
 	mime_message_free(&msg);
@@ -111,7 +113,9 @@ static void test_smtp_format(void)
 
 	MimeMessage parsed;
 	assert(mime_parse_message(out, n2 - 3, &parsed) == 0);
-	assert(strcmp(parsed.attachments, "photo.png") == 0);
+	assert(strcmp(parsed.attachments_summary, "photo.png") == 0);
+	assert(parsed.attachment_count == 1);
+	assert(parsed.attachments[0].size == sizeof(png_stub));
 	assert(strstr(parsed.body, "Line 1") != NULL);
 	mime_message_free(&parsed);
 	printf("[PASS] test_smtp_format\n");

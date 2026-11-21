@@ -7,14 +7,27 @@
 extern "C" {
 #endif
 
+#define MIME_MAX_ATTACHMENTS 16
+
+typedef struct MimeAttachment {
+	char filename[128];
+	char mime_type[64];
+	char content_id[128];
+	unsigned char *data;
+	size_t size;
+} MimeAttachment;
+
 typedef struct MimeMessage {
 	char subject[512];
 	char from[256];
 	char to[256];
 	char date[128];
 	char message_id[256];
-	char attachments[512]; /* comma-separated list of attachment filenames, if any */
-	char *body;            /* heap-allocated UTF-8 plain text */
+	char attachments_summary[512]; /* comma-separated list of attachment filenames */
+	MimeAttachment attachments[MIME_MAX_ATTACHMENTS];
+	int attachment_count;
+	char *body;      /* heap-allocated UTF-8 plain text */
+	char *html_body; /* heap-allocated UTF-8 HTML (NULL if none) */
 } MimeMessage;
 
 /* Free heap fields inside MimeMessage (does not free msg itself). */

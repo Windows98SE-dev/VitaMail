@@ -185,6 +185,39 @@ static CachedGlyph *get_glyph(uint32_t cp, int size_px)
 	return cg;
 }
 
+int ui_measure_text(int size_px, const char *text)
+{
+	if (!g_ui.ft_ready || !text)
+		return 0;
+	int pen_x = 0;
+	const char *p = text;
+	while (*p) {
+		uint32_t cp = next_utf8(&p);
+		if (cp == '\r' || cp == '\n' || cp == '\t')
+			cp = ' ';
+		CachedGlyph *cg = get_glyph(cp, size_px);
+		if (cg)
+			pen_x += cg->advance;
+	}
+	return pen_x;
+}
+
+void ui_draw_text_styled(int x, int y, int size_px, UiColor c, const char *text, int max_w,
+                         int bold, int underline, int strike)
+{
+	ui_draw_text(x, y, size_px, c, text, max_w);
+	if (bold)
+		ui_draw_text(x + 1, y, size_px, c, text, max_w);
+	if (underline || strike) {
+		int w = ui_measure_text(size_px, text);
+		if (max_w > 0 && w > max_w) w = max_w;
+		if (underline)
+			ui_fill_rect(x, y + size_px + 2, w, 1, c);
+		if (strike)
+			ui_fill_rect(x, y + (size_px * 2) / 3, w, 1, c);
+	}
+}
+
 void ui_draw_text(int x, int y, int size_px, UiColor c, const char *text, int max_w)
 {
 	if (!g_ui.ft_ready || !text)

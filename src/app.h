@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-int app_init(void);
+int app_init(SDL_Renderer *ren);
 void app_shutdown(void);
 void app_handle_event(const SDL_Event *ev);
 void app_update(void);

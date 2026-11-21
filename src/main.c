@@ -57,7 +57,7 @@ int main(int argc, char *argv[])
 	net_tls_global_init(NULL);
 	ime_global_init();
 	ui_init(ren, FONT_PATH);
-	app_init();
+	app_init(ren);
 
 	while (!app_should_quit()) {
 		SDL_Event ev;

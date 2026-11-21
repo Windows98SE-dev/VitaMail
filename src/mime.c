@@ -36,6 +36,14 @@ void mime_message_free(MimeMessage *msg)
 		return;
 	free(msg->body);
 	msg->body = NULL;
+	free(msg->html_body);
+	msg->html_body = NULL;
+	for (int i = 0; i < msg->attachment_count && i < MIME_MAX_ATTACHMENTS; i++) {
+		free(msg->attachments[i].data);
+		msg->attachments[i].data = NULL;
+		msg->attachments[i].size = 0;
+	}
+	msg->attachment_count = 0;
 }
 
 size_t mime_base64_encode(const unsigned char *in, size_t in_len, char *out, size_t out_cap)
@@ -394,15 +402,16 @@ static const char *find_header_body_split(const char *raw, size_t len, size_t *h
 static void decode_body_part(const char *hdrs, size_t hdr_len,
                              const char *body, size_t body_len,
                              char **plain_out, char **html_out,
-                             char *attachments, size_t att_cap, int depth)
+                             char **raw_html_out, MimeMessage *msg, int depth)
 {
-	if (depth > 4)
+	if (depth > 6)
 		return;
 
-	char ctype[256], cte[64], cdisp[256];
+	char ctype[256], cte[64], cdisp[256], cid[128];
 	extract_header_value(hdrs, hdr_len, "Content-Type", ctype, sizeof(ctype));
 	extract_header_value(hdrs, hdr_len, "Content-Transfer-Encoding", cte, sizeof(cte));
 	extract_header_value(hdrs, hdr_len, "Content-Disposition", cdisp, sizeof(cdisp));
+	extract_header_value(hdrs, hdr_len, "Content-ID", cid, sizeof(cid));
 
 	if (ctype[0] == '\0')
 		snprintf(ctype, sizeof(ctype), "text/plain");
@@ -453,30 +462,76 @@ static void decode_body_part(const char *hdrs, size_t hdr_len,
 			const char *pbody = find_header_body_split(part, plen, &phdr_len);
 			size_t pbody_len = (size_t)((part + plen) - pbody);
 			decode_body_part(part, phdr_len, pbody, pbody_len,
-			                 plain_out, html_out, attachments, att_cap, depth + 1);
+			                 plain_out, html_out, raw_html_out, msg, depth + 1);
 			p = next;
-		}
-		return;
-	}
-
-	/* Check attachment */
-	if (ci_strstr(cdisp, "attachment") != NULL) {
-		char fname[128];
-		extract_param(cdisp, "filename", fname, sizeof(fname));
-		if (fname[0] == '\0')
-			extract_param(ctype, "name", fname, sizeof(fname));
-		if (fname[0] != '\0' && attachments[0] == '\0') {
-			snprintf(attachments, att_cap, "%s", fname);
-		} else if (fname[0] != '\0') {
-			size_t cur = strlen(attachments);
-			if (cur + 3 + strlen(fname) < att_cap)
-				snprintf(attachments + cur, att_cap - cur, ", %s", fname);
 		}
 		return;
 	}
 
 	int is_plain = (ci_strstr(ctype, "text/plain") != NULL);
 	int is_html = (ci_strstr(ctype, "text/html") != NULL);
+	int is_att = (ci_strstr(cdisp, "attachment") != NULL) ||
+	             (!is_plain && !is_html &&
+	              (ci_strstr(cdisp, "inline") != NULL || cid[0] != '\0' ||
+	               ci_strstr(ctype, "image/") != NULL || ci_strstr(ctype, "application/") != NULL));
+
+	if (is_att) {
+		char fname[128];
+		extract_param(cdisp, "filename", fname, sizeof(fname));
+		if (fname[0] == '\0')
+			extract_param(ctype, "name", fname, sizeof(fname));
+		if (fname[0] == '\0')
+			snprintf(fname, sizeof(fname), "attachment_%d", msg->attachment_count + 1);
+
+		if (msg->attachments_summary[0] == '\0') {
+			snprintf(msg->attachments_summary, sizeof(msg->attachments_summary), "%s", fname);
+		} else {
+			size_t cur = strlen(msg->attachments_summary);
+			if (cur + 3 + strlen(fname) < sizeof(msg->attachments_summary))
+				snprintf(msg->attachments_summary + cur,
+				         sizeof(msg->attachments_summary) - cur, ", %s", fname);
+		}
+
+		if (msg->attachment_count < MIME_MAX_ATTACHMENTS && body_len > 0 && body_len <= 12 * 1024 * 1024) {
+			unsigned char *dec = (unsigned char *)malloc(body_len + 4);
+			if (dec) {
+				size_t dlen = body_len;
+				if (ci_strstr(cte, "base64") != NULL) {
+					dlen = mime_base64_decode(body, body_len, dec, body_len + 1);
+				} else if (ci_strstr(cte, "quoted-printable") != NULL) {
+					dlen = mime_qp_decode(body, body_len, (char *)dec, body_len + 1);
+				} else {
+					memcpy(dec, body, body_len);
+					dec[body_len] = '\0';
+				}
+
+				MimeAttachment *att = &msg->attachments[msg->attachment_count++];
+				snprintf(att->filename, sizeof(att->filename), "%.127s", fname);
+				/* Extract bare mime type before ';' */
+				size_t mlen = 0;
+				while (ctype[mlen] && ctype[mlen] != ';' && ctype[mlen] != ' ' &&
+				       mlen + 1 < sizeof(att->mime_type)) {
+					att->mime_type[mlen] = (char)tolower((unsigned char)ctype[mlen]);
+					mlen++;
+				}
+				att->mime_type[mlen] = '\0';
+
+				/* Strip < > from Content-ID */
+				const char *cs = cid;
+				if (*cs == '<') cs++;
+				size_t cl = strlen(cs);
+				if (cl > 0 && cs[cl - 1] == '>') cl--;
+				if (cl >= sizeof(att->content_id)) cl = sizeof(att->content_id) - 1;
+				memcpy(att->content_id, cs, cl);
+				att->content_id[cl] = '\0';
+
+				att->data = dec;
+				att->size = dlen;
+			}
+		}
+		return;
+	}
+
 	if (!is_plain && !is_html)
 		return;
 
@@ -497,6 +552,13 @@ static void decode_body_part(const char *hdrs, size_t hdr_len,
 	if (is_plain && !*plain_out) {
 		*plain_out = decoded;
 	} else if (is_html && !*html_out) {
+		if (raw_html_out && !*raw_html_out) {
+			*raw_html_out = (char *)malloc(dlen + 1);
+			if (*raw_html_out) {
+				memcpy(*raw_html_out, decoded, dlen);
+				(*raw_html_out)[dlen] = '\0';
+			}
+		}
 		char *text = (char *)malloc(dlen + 1);
 		if (text) {
 			mime_html_to_text(decoded, dlen, text, dlen + 1);
@@ -529,9 +591,11 @@ int mime_parse_message(const char *raw, size_t raw_len, MimeMessage *out)
 
 	char *plain = NULL;
 	char *html = NULL;
+	char *raw_html = NULL;
 	decode_body_part(raw, hdr_len, body, body_len,
-	                 &plain, &html, out->attachments, sizeof(out->attachments), 0);
+	                 &plain, &html, &raw_html, out, 0);
 
+	out->html_body = raw_html;
 	if (plain) {
 		out->body = plain;
 		free(html);

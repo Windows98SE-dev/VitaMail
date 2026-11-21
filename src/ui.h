@@ -30,6 +30,13 @@ void ui_fill_circle_dot(int cx, int cy, int r, UiColor c);
 /* Draw single-line UTF-8 text truncated with '...' if wider than max_w (0 = no clip). */
 void ui_draw_text(int x, int y, int size_px, UiColor c, const char *text, int max_w);
 
+/* Measure single-line UTF-8 text width in pixels. */
+int ui_measure_text(int size_px, const char *text);
+
+/* Draw single-line UTF-8 text with optional bold, underline, strikethrough. */
+void ui_draw_text_styled(int x, int y, int size_px, UiColor c, const char *text, int max_w,
+                         int bold, int underline, int strike);
+
 /* Draw word-wrapped UTF-8 text inside rect starting at y - scroll_y.
  * Returns total content height in pixels. */
 int ui_draw_wrapped_text(int x, int y, int max_w, int max_h, int size_px,
