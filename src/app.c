@@ -1,0 +1,996 @@
+#include "app.h"
+#include "config.h"
+#include "imap.h"
+#include "ime.h"
+#include "mime.h"
+#include "net_tls.h"
+#include "smtp.h"
+#include "ui.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef __vita__
+#include <psp2/ctrl.h>
+#include <psp2/kernel/threadmgr.h>
+#endif
+
+typedef enum ScreenMode {
+	SCREEN_INBOX = 0,
+	SCREEN_READER,
+	SCREEN_COMPOSE,
+	SCREEN_SETTINGS
+} ScreenMode;
+
+typedef enum WorkerJobType {
+	JOB_NONE = 0,
+	JOB_SYNC_FOLDER,
+	JOB_FETCH_MESSAGE,
+	JOB_SEND_EMAIL,
+	JOB_TOGGLE_SEEN,
+	JOB_DELETE_MESSAGE
+} WorkerJobType;
+
+typedef enum ImeTarget {
+	IME_TGT_NONE = 0,
+	IME_TGT_SET_EMAIL,
+	IME_TGT_SET_PASS,
+	IME_TGT_SET_IMAP_HOST,
+	IME_TGT_SET_IMAP_PORT,
+	IME_TGT_SET_SMTP_HOST,
+	IME_TGT_SET_SMTP_PORT,
+	IME_TGT_CMP_TO,
+	IME_TGT_CMP_SUBJECT,
+	IME_TGT_CMP_BODY
+} ImeTarget;
+
+/* Palette */
+static const UiColor COL_BG        = { 15, 20, 30, 255 };
+static const UiColor COL_PANEL     = { 24, 31, 46, 255 };
+static const UiColor COL_PANEL_ALT = { 30, 39, 58, 255 };
+static const UiColor COL_SEL       = { 34, 82, 148, 255 };
+static const UiColor COL_BORDER    = { 52, 65, 92, 255 };
+static const UiColor COL_ACCENT    = { 66, 153, 225, 255 };
+static const UiColor COL_GREEN     = { 46, 184, 114, 255 };
+static const UiColor COL_RED       = { 224, 79, 95, 255 };
+static const UiColor COL_TEXT      = { 236, 240, 248, 255 };
+static const UiColor COL_MUTED     = { 148, 163, 184, 255 };
+
+static struct {
+	int quit;
+	ScreenMode screen;
+	int show_tls_modal;
+
+	MailAccountConfig cfg;
+	MailAccountConfig edit_cfg;
+
+	/* Folders & messages */
+	ImapFolder folders[IMAP_MAX_FOLDERS];
+	int folder_count;
+	int selected_folder;
+
+	ImapHeader headers[IMAP_MAX_HEADERS];
+	int header_count;
+	int selected_msg;
+	int list_scroll;
+
+	MimeMessage open_msg;
+	uint32_t open_uid;
+	int reader_scroll;
+	int reader_total_h;
+
+	/* Compose state */
+	char cmp_to[256];
+	char cmp_subject[256];
+	char cmp_body[4096];
+	char cmp_reply_id[256];
+	int cmp_focus; /* 0=To, 1=Subject, 2=Body, 3=Send, 4=Cancel */
+
+	/* Settings state */
+	int set_focus; /* 0=Preset, 1=Email, 2=Pass, 3=ImapHost, 4=ImapPort, 5=ImapTLS,
+	                  6=SmtpHost, 7=SmtpPort, 8=SmtpTLS, 9=Save&Connect, 10=Back */
+
+	/* IME */
+	ImeTarget ime_target;
+	char ime_buf[4096];
+
+	/* Background worker */
+	SDL_mutex *lock;
+	SDL_Thread *worker;
+	WorkerJobType job_type;
+	uint32_t job_uid;
+	int job_flag;
+	char job_folder[128];
+	int busy;
+	char status_msg[256];
+	int status_is_err;
+
+	/* Stick repeat timer */
+	uint32_t last_nav_tick;
+} g_app;
+
+static void set_status(const char *msg, int is_err)
+{
+	SDL_LockMutex(g_app.lock);
+	snprintf(g_app.status_msg, sizeof(g_app.status_msg), "%s", msg);
+	g_app.status_is_err = is_err;
+	SDL_UnlockMutex(g_app.lock);
+}
+
+static int worker_thread_fn(void *arg)
+{
+	(void)arg;
+	SDL_LockMutex(g_app.lock);
+	WorkerJobType job = g_app.job_type;
+	uint32_t uid = g_app.job_uid;
+	int flag = g_app.job_flag;
+	char folder[128];
+	snprintf(folder, sizeof(folder), "%s", g_app.job_folder);
+	MailAccountConfig cfg = g_app.cfg;
+	SDL_UnlockMutex(g_app.lock);
+
+	char err[256] = {0};
+
+	if (job == JOB_SYNC_FOLDER) {
+		set_status("Connecting via TLS...", 0);
+		ImapSession sess;
+		if (imap_connect(&sess, cfg.imap_host, cfg.imap_port, cfg.imap_starttls,
+		                 cfg.email, cfg.password, err, sizeof(err)) != 0) {
+			set_status(err, 1);
+			goto done;
+		}
+
+		if (g_app.folder_count == 0) {
+			ImapFolder ftmp[IMAP_MAX_FOLDERS];
+			int fc = imap_list_folders(&sess, ftmp, IMAP_MAX_FOLDERS, err, sizeof(err));
+			if (fc > 0) {
+				SDL_LockMutex(g_app.lock);
+				memcpy(g_app.folders, ftmp, sizeof(ImapFolder) * (size_t)fc);
+				g_app.folder_count = fc;
+				SDL_UnlockMutex(g_app.lock);
+			}
+		}
+
+		set_status("Syncing mailbox...", 0);
+		if (imap_select_folder(&sess, folder, err, sizeof(err)) != 0) {
+			imap_disconnect(&sess);
+			set_status(err, 1);
+			goto done;
+		}
+
+		ImapHeader htmp[IMAP_MAX_HEADERS];
+		int hc = imap_fetch_headers(&sess, htmp, IMAP_MAX_HEADERS, err, sizeof(err));
+		imap_disconnect(&sess);
+
+		if (hc < 0) {
+			set_status(err, 1);
+			goto done;
+		}
+
+		SDL_LockMutex(g_app.lock);
+		memcpy(g_app.headers, htmp, sizeof(ImapHeader) * (size_t)hc);
+		g_app.header_count = hc;
+		g_app.selected_msg = 0;
+		g_app.list_scroll = 0;
+		snprintf(g_app.status_msg, sizeof(g_app.status_msg),
+		         "Synced %d messages in %s", hc, folder);
+		g_app.status_is_err = 0;
+		SDL_UnlockMutex(g_app.lock);
+	} else if (job == JOB_FETCH_MESSAGE) {
+		set_status("Fetching message...", 0);
+		ImapSession sess;
+		if (imap_connect(&sess, cfg.imap_host, cfg.imap_port, cfg.imap_starttls,
+		                 cfg.email, cfg.password, err, sizeof(err)) != 0) {
+			set_status(err, 1);
+			goto done;
+		}
+		if (imap_select_folder(&sess, folder, err, sizeof(err)) != 0) {
+			imap_disconnect(&sess);
+			set_status(err, 1);
+			goto done;
+		}
+
+		MimeMessage msg;
+		if (imap_fetch_message(&sess, uid, &msg, err, sizeof(err)) != 0) {
+			imap_disconnect(&sess);
+			set_status(err, 1);
+			goto done;
+		}
+		imap_set_seen(&sess, uid, 1, err, sizeof(err));
+		imap_disconnect(&sess);
+
+		SDL_LockMutex(g_app.lock);
+		mime_message_free(&g_app.open_msg);
+		g_app.open_msg = msg;
+		g_app.open_uid = uid;
+		g_app.reader_scroll = 0;
+		g_app.screen = SCREEN_READER;
+		for (int i = 0; i < g_app.header_count; i++) {
+			if (g_app.headers[i].uid == uid)
+				g_app.headers[i].seen = 1;
+		}
+		g_app.status_msg[0] = '\0';
+		g_app.status_is_err = 0;
+		SDL_UnlockMutex(g_app.lock);
+	} else if (job == JOB_SEND_EMAIL) {
+		set_status("Sending via SMTP TLS...", 0);
+		SDL_LockMutex(g_app.lock);
+		char to[256], subj[256], body[4096], rep[256];
+		snprintf(to, sizeof(to), "%s", g_app.cmp_to);
+		snprintf(subj, sizeof(subj), "%s", g_app.cmp_subject);
+		snprintf(body, sizeof(body), "%s", g_app.cmp_body);
+		snprintf(rep, sizeof(rep), "%s", g_app.cmp_reply_id);
+		SDL_UnlockMutex(g_app.lock);
+
+		SmtpSendRequest req = {
+			.host = cfg.smtp_host,
+			.port = cfg.smtp_port,
+			.use_starttls = cfg.smtp_starttls,
+			.user = cfg.email,
+			.pass = cfg.password,
+			.from = cfg.email,
+			.to = to,
+			.subject = subj,
+			.body = body,
+			.in_reply_to = rep
+		};
+		if (smtp_send_email(&req, err, sizeof(err)) != 0) {
+			set_status(err, 1);
+			goto done;
+		}
+		SDL_LockMutex(g_app.lock);
+		g_app.screen = SCREEN_INBOX;
+		snprintf(g_app.status_msg, sizeof(g_app.status_msg), "Email sent to %s", to);
+		g_app.status_is_err = 0;
+		SDL_UnlockMutex(g_app.lock);
+	} else if (job == JOB_TOGGLE_SEEN || job == JOB_DELETE_MESSAGE) {
+		set_status(job == JOB_DELETE_MESSAGE ? "Deleting message..." : "Updating flags...", 0);
+		ImapSession sess;
+		if (imap_connect(&sess, cfg.imap_host, cfg.imap_port, cfg.imap_starttls,
+		                 cfg.email, cfg.password, err, sizeof(err)) != 0 ||
+		    imap_select_folder(&sess, folder, err, sizeof(err)) != 0) {
+			imap_disconnect(&sess);
+			set_status(err, 1);
+			goto done;
+		}
+
+		if (job == JOB_TOGGLE_SEEN) {
+			if (imap_set_seen(&sess, uid, flag, err, sizeof(err)) == 0) {
+				SDL_LockMutex(g_app.lock);
+				for (int i = 0; i < g_app.header_count; i++) {
+					if (g_app.headers[i].uid == uid)
+						g_app.headers[i].seen = flag;
+				}
+				snprintf(g_app.status_msg, sizeof(g_app.status_msg),
+				         flag ? "Marked as read" : "Marked as unread");
+				g_app.status_is_err = 0;
+				SDL_UnlockMutex(g_app.lock);
+			} else {
+				set_status(err, 1);
+			}
+		} else {
+			if (imap_delete_message(&sess, uid, err, sizeof(err)) == 0) {
+				SDL_LockMutex(g_app.lock);
+				for (int i = 0; i < g_app.header_count; i++) {
+					if (g_app.headers[i].uid == uid) {
+						memmove(&g_app.headers[i], &g_app.headers[i + 1],
+						        sizeof(ImapHeader) * (size_t)(g_app.header_count - 1 - i));
+						g_app.header_count--;
+						if (g_app.selected_msg >= g_app.header_count && g_app.selected_msg > 0)
+							g_app.selected_msg--;
+						break;
+					}
+				}
+				g_app.screen = SCREEN_INBOX;
+				snprintf(g_app.status_msg, sizeof(g_app.status_msg), "Message deleted");
+				g_app.status_is_err = 0;
+				SDL_UnlockMutex(g_app.lock);
+			} else {
+				set_status(err, 1);
+			}
+		}
+		imap_disconnect(&sess);
+	}
+
+done:
+	SDL_LockMutex(g_app.lock);
+	g_app.busy = 0;
+	SDL_UnlockMutex(g_app.lock);
+	return 0;
+}
+
+static void start_job(WorkerJobType job, uint32_t uid, int flag)
+{
+	if (g_app.busy)
+		return;
+	if (g_app.cfg.email[0] == '\0' || g_app.cfg.password[0] == '\0') {
+		set_status("Configure your email & password in Settings (Start)", 1);
+		return;
+	}
+	if (g_app.worker) {
+		SDL_WaitThread(g_app.worker, NULL);
+		g_app.worker = NULL;
+	}
+
+	SDL_LockMutex(g_app.lock);
+	g_app.job_type = job;
+	g_app.job_uid = uid;
+	g_app.job_flag = flag;
+	if (g_app.folder_count > 0 && g_app.selected_folder < g_app.folder_count)
+		snprintf(g_app.job_folder, sizeof(g_app.job_folder), "%s",
+		         g_app.folders[g_app.selected_folder].name);
+	else
+		snprintf(g_app.job_folder, sizeof(g_app.job_folder), "INBOX");
+	g_app.busy = 1;
+	SDL_UnlockMutex(g_app.lock);
+
+	g_app.worker = SDL_CreateThread(worker_thread_fn, "MailWorker", NULL);
+}
+
+static void begin_ime(ImeTarget tgt, const char *title, const char *init_val,
+                      ImeFieldKind kind, size_t max_chars)
+{
+	if (ime_is_active())
+		return;
+	g_app.ime_target = tgt;
+	memset(g_app.ime_buf, 0, sizeof(g_app.ime_buf));
+	if (ime_start(title, init_val, kind, max_chars) != 0) {
+		g_app.ime_target = IME_TGT_NONE;
+		set_status("On-screen keyboard only available on PS Vita", 1);
+	}
+}
+
+static void open_compose_new(void)
+{
+	memset(g_app.cmp_to, 0, sizeof(g_app.cmp_to));
+	memset(g_app.cmp_subject, 0, sizeof(g_app.cmp_subject));
+	memset(g_app.cmp_body, 0, sizeof(g_app.cmp_body));
+	memset(g_app.cmp_reply_id, 0, sizeof(g_app.cmp_reply_id));
+	g_app.cmp_focus = 0;
+	g_app.screen = SCREEN_COMPOSE;
+}
+
+static void open_compose_reply(void)
+{
+	memset(g_app.cmp_to, 0, sizeof(g_app.cmp_to));
+	memset(g_app.cmp_subject, 0, sizeof(g_app.cmp_subject));
+	memset(g_app.cmp_body, 0, sizeof(g_app.cmp_body));
+	/* Extract email inside <...> if present */
+	const char *lt = strchr(g_app.open_msg.from, '<');
+	const char *gt = lt ? strchr(lt + 1, '>') : NULL;
+	if (lt && gt && gt > lt + 1) {
+		size_t n = (size_t)(gt - (lt + 1));
+		if (n >= sizeof(g_app.cmp_to)) n = sizeof(g_app.cmp_to) - 1;
+		memcpy(g_app.cmp_to, lt + 1, n);
+		g_app.cmp_to[n] = '\0';
+	} else {
+		snprintf(g_app.cmp_to, sizeof(g_app.cmp_to), "%s", g_app.open_msg.from);
+	}
+
+	if (strncmp(g_app.open_msg.subject, "Re:", 3) == 0 ||
+	    strncmp(g_app.open_msg.subject, "RE:", 3) == 0) {
+		snprintf(g_app.cmp_subject, sizeof(g_app.cmp_subject), "%s", g_app.open_msg.subject);
+	} else {
+		snprintf(g_app.cmp_subject, sizeof(g_app.cmp_subject), "Re: %s", g_app.open_msg.subject);
+	}
+	snprintf(g_app.cmp_reply_id, sizeof(g_app.cmp_reply_id), "%s", g_app.open_msg.message_id);
+	g_app.cmp_focus = 2; /* Focus body */
+	g_app.screen = SCREEN_COMPOSE;
+}
+
+static void activate_settings_field(int idx)
+{
+	char port_buf[16];
+	switch (idx) {
+	case 0: {
+		MailPreset next = (MailPreset)((g_app.edit_cfg.preset + 1) % PRESET_COUNT);
+		config_apply_preset(&g_app.edit_cfg, next);
+		break;
+	}
+	case 1:
+		begin_ime(IME_TGT_SET_EMAIL, "Email Address", g_app.edit_cfg.email, IME_KIND_EMAIL, 127);
+		break;
+	case 2:
+		begin_ime(IME_TGT_SET_PASS, "Password / App Password", g_app.edit_cfg.password, IME_KIND_PASSWORD, 127);
+		break;
+	case 3:
+		begin_ime(IME_TGT_SET_IMAP_HOST, "IMAP Server Host", g_app.edit_cfg.imap_host, IME_KIND_TEXT, 127);
+		break;
+	case 4:
+		snprintf(port_buf, sizeof(port_buf), "%u", (unsigned)g_app.edit_cfg.imap_port);
+		begin_ime(IME_TGT_SET_IMAP_PORT, "IMAP Port", port_buf, IME_KIND_NUMBER, 5);
+		break;
+	case 5:
+		g_app.edit_cfg.imap_starttls = !g_app.edit_cfg.imap_starttls;
+		break;
+	case 6:
+		begin_ime(IME_TGT_SET_SMTP_HOST, "SMTP Server Host", g_app.edit_cfg.smtp_host, IME_KIND_TEXT, 127);
+		break;
+	case 7:
+		snprintf(port_buf, sizeof(port_buf), "%u", (unsigned)g_app.edit_cfg.smtp_port);
+		begin_ime(IME_TGT_SET_SMTP_PORT, "SMTP Port", port_buf, IME_KIND_NUMBER, 5);
+		break;
+	case 8:
+		g_app.edit_cfg.smtp_starttls = !g_app.edit_cfg.smtp_starttls;
+		break;
+	case 9:
+		g_app.cfg = g_app.edit_cfg;
+		config_save(&g_app.cfg, VITAMAIL_CONFIG_PATH);
+		g_app.folder_count = 0;
+		g_app.selected_folder = 0;
+		g_app.screen = SCREEN_INBOX;
+		start_job(JOB_SYNC_FOLDER, 0, 0);
+		break;
+	case 10:
+		g_app.screen = SCREEN_INBOX;
+		break;
+	}
+}
+
+static void activate_compose_field(int idx)
+{
+	switch (idx) {
+	case 0:
+		begin_ime(IME_TGT_CMP_TO, "To (Recipient Email)", g_app.cmp_to, IME_KIND_EMAIL, 255);
+		break;
+	case 1:
+		begin_ime(IME_TGT_CMP_SUBJECT, "Subject", g_app.cmp_subject, IME_KIND_TEXT, 255);
+		break;
+	case 2:
+		begin_ime(IME_TGT_CMP_BODY, "Message Body", g_app.cmp_body, IME_KIND_MULTILINE, 2000);
+		break;
+	case 3:
+		if (g_app.cmp_to[0] == '\0') {
+			set_status("Recipient (To) is required", 1);
+		} else {
+			start_job(JOB_SEND_EMAIL, 0, 0);
+		}
+		break;
+	case 4:
+		g_app.screen = SCREEN_INBOX;
+		break;
+	}
+}
+
+int app_init(void)
+{
+	memset(&g_app, 0, sizeof(g_app));
+	g_app.lock = SDL_CreateMutex();
+	snprintf(g_app.folders[0].name, sizeof(g_app.folders[0].name), "INBOX");
+	g_app.folder_count = 1;
+
+	if (config_load(&g_app.cfg, VITAMAIL_CONFIG_PATH) != 0) {
+		g_app.screen = SCREEN_SETTINGS;
+		g_app.edit_cfg = g_app.cfg;
+		set_status("Welcome! Enter your email & app password to begin.", 0);
+	} else {
+		g_app.screen = SCREEN_INBOX;
+		start_job(JOB_SYNC_FOLDER, 0, 0);
+	}
+
+	NetTlsStatus st;
+	net_tls_get_status(&st);
+	if (!st.ca_found || st.ca_loaded_count == 0) {
+		g_app.show_tls_modal = 1;
+	}
+	return 0;
+}
+
+void app_shutdown(void)
+{
+	if (g_app.worker) {
+		SDL_WaitThread(g_app.worker, NULL);
+		g_app.worker = NULL;
+	}
+	mime_message_free(&g_app.open_msg);
+	if (g_app.lock) {
+		SDL_DestroyMutex(g_app.lock);
+		g_app.lock = NULL;
+	}
+}
+
+int app_should_quit(void)
+{
+	return g_app.quit;
+}
+
+static void handle_button_confirm(void)
+{
+	if (g_app.show_tls_modal) {
+		net_tls_reload_ca(NULL);
+		return;
+	}
+	if (g_app.screen == SCREEN_INBOX) {
+		if (!g_app.busy && g_app.header_count > 0) {
+			uint32_t uid = g_app.headers[g_app.selected_msg].uid;
+			start_job(JOB_FETCH_MESSAGE, uid, 0);
+		}
+	} else if (g_app.screen == SCREEN_READER) {
+		if (!g_app.busy)
+			start_job(JOB_DELETE_MESSAGE, g_app.open_uid, 0);
+	} else if (g_app.screen == SCREEN_COMPOSE) {
+		activate_compose_field(g_app.cmp_focus);
+	} else if (g_app.screen == SCREEN_SETTINGS) {
+		activate_settings_field(g_app.set_focus);
+	}
+}
+
+static void handle_button_back(void)
+{
+	if (g_app.show_tls_modal) {
+		g_app.show_tls_modal = 0;
+		return;
+	}
+	if (g_app.screen == SCREEN_READER || g_app.screen == SCREEN_COMPOSE || g_app.screen == SCREEN_SETTINGS) {
+		g_app.screen = SCREEN_INBOX;
+	}
+}
+
+static void handle_nav(int dy, int dx)
+{
+	if (g_app.show_tls_modal)
+		return;
+
+	if (g_app.screen == SCREEN_INBOX) {
+		if (dy != 0 && g_app.header_count > 0) {
+			g_app.selected_msg += dy;
+			if (g_app.selected_msg < 0) g_app.selected_msg = 0;
+			if (g_app.selected_msg >= g_app.header_count)
+				g_app.selected_msg = g_app.header_count - 1;
+			if (g_app.selected_msg < g_app.list_scroll)
+				g_app.list_scroll = g_app.selected_msg;
+			if (g_app.selected_msg >= g_app.list_scroll + 8)
+				g_app.list_scroll = g_app.selected_msg - 7;
+		}
+		if (dx != 0 && g_app.folder_count > 1 && !g_app.busy) {
+			g_app.selected_folder = (g_app.selected_folder + dx + g_app.folder_count) % g_app.folder_count;
+			start_job(JOB_SYNC_FOLDER, 0, 0);
+		}
+	} else if (g_app.screen == SCREEN_READER) {
+		g_app.reader_scroll += dy * 36;
+		if (g_app.reader_scroll < 0)
+			g_app.reader_scroll = 0;
+	} else if (g_app.screen == SCREEN_COMPOSE) {
+		g_app.cmp_focus = (g_app.cmp_focus + dy + 5) % 5;
+	} else if (g_app.screen == SCREEN_SETTINGS) {
+		g_app.set_focus = (g_app.set_focus + dy + 11) % 11;
+	}
+}
+
+static void handle_touch_tap(int x, int y)
+{
+	/* Top-bar iTLS pill */
+	UiRect tls_pill = { 690, 8, 256, 28 };
+	if (ui_point_in_rect(x, y, tls_pill)) {
+		g_app.show_tls_modal = !g_app.show_tls_modal;
+		return;
+	}
+
+	if (g_app.show_tls_modal) {
+		UiRect btn_recheck = { 290, 360, 180, 38 };
+		UiRect btn_close   = { 490, 360, 180, 38 };
+		if (ui_point_in_rect(x, y, btn_recheck)) {
+			net_tls_reload_ca(NULL);
+		} else if (ui_point_in_rect(x, y, btn_close)) {
+			g_app.show_tls_modal = 0;
+		}
+		return;
+	}
+
+	if (g_app.screen == SCREEN_INBOX) {
+		/* Sidebar Compose & Settings buttons */
+		if (ui_point_in_rect(x, y, (UiRect){ 14, 56, 182, 36 })) {
+			open_compose_new();
+			return;
+		}
+		if (ui_point_in_rect(x, y, (UiRect){ 14, 100, 182, 36 })) {
+			g_app.edit_cfg = g_app.cfg;
+			g_app.set_focus = 0;
+			g_app.screen = SCREEN_SETTINGS;
+			return;
+		}
+		/* Folder items */
+		for (int i = 0; i < g_app.folder_count && i < 8; i++) {
+			UiRect fr = { 14, 158 + i * 38, 182, 34 };
+			if (ui_point_in_rect(x, y, fr) && !g_app.busy) {
+				g_app.selected_folder = i;
+				start_job(JOB_SYNC_FOLDER, 0, 0);
+				return;
+			}
+		}
+		/* Email rows */
+		for (int row = 0; row < 8; row++) {
+			int idx = g_app.list_scroll + row;
+			if (idx >= g_app.header_count)
+				break;
+			UiRect mr = { 216, 54 + row * 56, 730, 52 };
+			if (ui_point_in_rect(x, y, mr) && !g_app.busy) {
+				g_app.selected_msg = idx;
+				start_job(JOB_FETCH_MESSAGE, g_app.headers[idx].uid, 0);
+				return;
+			}
+		}
+	} else if (g_app.screen == SCREEN_READER) {
+		if (ui_point_in_rect(x, y, (UiRect){ 20, 488, 130, 38 })) {
+			open_compose_reply();
+		} else if (ui_point_in_rect(x, y, (UiRect){ 165, 488, 170, 38 }) && !g_app.busy) {
+			int cur_seen = 1;
+			for (int i = 0; i < g_app.header_count; i++) {
+				if (g_app.headers[i].uid == g_app.open_uid) {
+					cur_seen = g_app.headers[i].seen;
+					break;
+				}
+			}
+			start_job(JOB_TOGGLE_SEEN, g_app.open_uid, !cur_seen);
+		} else if (ui_point_in_rect(x, y, (UiRect){ 350, 488, 130, 38 }) && !g_app.busy) {
+			start_job(JOB_DELETE_MESSAGE, g_app.open_uid, 0);
+		} else if (ui_point_in_rect(x, y, (UiRect){ 810, 488, 130, 38 })) {
+			g_app.screen = SCREEN_INBOX;
+		}
+	} else if (g_app.screen == SCREEN_COMPOSE) {
+		if (ui_point_in_rect(x, y, (UiRect){ 40, 74, 880, 40 })) { g_app.cmp_focus = 0; activate_compose_field(0); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 40, 126, 880, 40 })) { g_app.cmp_focus = 1; activate_compose_field(1); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 40, 178, 880, 270 })) { g_app.cmp_focus = 2; activate_compose_field(2); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 40, 468, 180, 42 })) { g_app.cmp_focus = 3; activate_compose_field(3); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 240, 468, 180, 42 })) { g_app.cmp_focus = 4; activate_compose_field(4); }
+	} else if (g_app.screen == SCREEN_SETTINGS) {
+		for (int i = 0; i < 9; i++) {
+			UiRect r = { 40, 62 + i * 42, 880, 36 };
+			if (ui_point_in_rect(x, y, r)) {
+				g_app.set_focus = i;
+				activate_settings_field(i);
+				return;
+			}
+		}
+		if (ui_point_in_rect(x, y, (UiRect){ 40, 456, 220, 42 })) { g_app.set_focus = 9; activate_settings_field(9); }
+		else if (ui_point_in_rect(x, y, (UiRect){ 280, 456, 160, 42 })) { g_app.set_focus = 10; activate_settings_field(10); }
+	}
+}
+
+void app_handle_event(const SDL_Event *ev)
+{
+	if (ev->type == SDL_QUIT) {
+		g_app.quit = 1;
+		return;
+	}
+
+	if (ime_is_active())
+		return;
+
+	if (ev->type == SDL_FINGERDOWN) {
+		int tx = (int)(ev->tfinger.x * VITA_SCREEN_W);
+		int ty = (int)(ev->tfinger.y * VITA_SCREEN_H);
+		handle_touch_tap(tx, ty);
+		return;
+	}
+
+	if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+		handle_touch_tap(ev->button.x, ev->button.y);
+		return;
+	}
+
+	/* SDL2 Vita controller mapping:
+	 * 0=Triangle, 1=Circle, 2=Cross, 3=Square, 4=L, 5=R,
+	 * 6=Down, 7=Left, 8=Up, 9=Right, 10=Select, 11=Start */
+	if (ev->type == SDL_JOYBUTTONDOWN) {
+		switch (ev->jbutton.button) {
+		case 2: /* Cross */
+			handle_button_confirm();
+			break;
+		case 1: /* Circle */
+			handle_button_back();
+			break;
+		case 3: /* Square */
+			if (g_app.screen == SCREEN_INBOX)
+				open_compose_new();
+			else if (g_app.screen == SCREEN_READER)
+				open_compose_reply();
+			break;
+		case 0: /* Triangle */
+			if (g_app.screen == SCREEN_INBOX && !g_app.busy)
+				start_job(JOB_SYNC_FOLDER, 0, 0);
+			else if (g_app.screen == SCREEN_READER && !g_app.busy)
+				start_job(JOB_TOGGLE_SEEN, g_app.open_uid, 0);
+			break;
+		case 4: /* L */
+			handle_nav(0, -1);
+			break;
+		case 5: /* R */
+			handle_nav(0, 1);
+			break;
+		case 6: /* Down */
+			handle_nav(1, 0);
+			break;
+		case 8: /* Up */
+			handle_nav(-1, 0);
+			break;
+		case 10: /* Select */
+			g_app.show_tls_modal = !g_app.show_tls_modal;
+			break;
+		case 11: /* Start */
+			if (g_app.screen != SCREEN_SETTINGS) {
+				g_app.edit_cfg = g_app.cfg;
+				g_app.set_focus = 0;
+				g_app.screen = SCREEN_SETTINGS;
+			} else {
+				g_app.screen = SCREEN_INBOX;
+			}
+			break;
+		}
+	}
+}
+
+void app_update(void)
+{
+	if (ime_is_active()) {
+		ImePollResult pr = ime_poll(g_app.ime_buf, sizeof(g_app.ime_buf));
+		if (pr == IME_POLL_CONFIRMED) {
+			switch (g_app.ime_target) {
+			case IME_TGT_SET_EMAIL:
+				snprintf(g_app.edit_cfg.email, sizeof(g_app.edit_cfg.email), "%.127s", g_app.ime_buf);
+				break;
+			case IME_TGT_SET_PASS:
+				snprintf(g_app.edit_cfg.password, sizeof(g_app.edit_cfg.password), "%.127s", g_app.ime_buf);
+				break;
+			case IME_TGT_SET_IMAP_HOST:
+				snprintf(g_app.edit_cfg.imap_host, sizeof(g_app.edit_cfg.imap_host), "%.127s", g_app.ime_buf);
+				break;
+			case IME_TGT_SET_IMAP_PORT:
+				g_app.edit_cfg.imap_port = (uint16_t)atoi(g_app.ime_buf);
+				break;
+			case IME_TGT_SET_SMTP_HOST:
+				snprintf(g_app.edit_cfg.smtp_host, sizeof(g_app.edit_cfg.smtp_host), "%.127s", g_app.ime_buf);
+				break;
+			case IME_TGT_SET_SMTP_PORT:
+				g_app.edit_cfg.smtp_port = (uint16_t)atoi(g_app.ime_buf);
+				break;
+			case IME_TGT_CMP_TO:
+				snprintf(g_app.cmp_to, sizeof(g_app.cmp_to), "%.255s", g_app.ime_buf);
+				break;
+			case IME_TGT_CMP_SUBJECT:
+				snprintf(g_app.cmp_subject, sizeof(g_app.cmp_subject), "%.255s", g_app.ime_buf);
+				break;
+			case IME_TGT_CMP_BODY:
+				snprintf(g_app.cmp_body, sizeof(g_app.cmp_body), "%s", g_app.ime_buf);
+				break;
+			default:
+				break;
+			}
+			g_app.ime_target = IME_TGT_NONE;
+		} else if (pr == IME_POLL_CANCELLED) {
+			g_app.ime_target = IME_TGT_NONE;
+		}
+		return;
+	}
+
+#ifdef __vita__
+	/* Smooth stick scrolling in Reader view */
+	if (g_app.screen == SCREEN_READER && !g_app.show_tls_modal) {
+		SceCtrlData pad;
+		sceCtrlPeekBufferPositive(0, &pad, 1);
+		int ry = (int)pad.ry - 128;
+		if (ry > 24 || ry < -24) {
+			g_app.reader_scroll += ry / 16;
+			if (g_app.reader_scroll < 0)
+				g_app.reader_scroll = 0;
+		}
+	}
+#endif
+}
+
+static void draw_button(int x, int y, int w, int h, const char *label, int focused, UiColor bg)
+{
+	ui_fill_rect(x, y, w, h, bg);
+	ui_draw_rect(x, y, w, h, focused ? COL_ACCENT : COL_BORDER);
+	ui_draw_text(x + 12, y + (h - 16) / 2, 16, COL_TEXT, label, w - 24);
+}
+
+static void render_top_bar(void)
+{
+	ui_fill_rect(0, 0, VITA_SCREEN_W, 44, COL_PANEL);
+	ui_fill_rect(0, 43, VITA_SCREEN_W, 1, COL_BORDER);
+
+	ui_draw_text(14, 11, 20, COL_ACCENT, "VitaMail", 0);
+
+	const char *sub = "Inbox";
+	if (g_app.screen == SCREEN_READER) sub = "Message";
+	else if (g_app.screen == SCREEN_COMPOSE) sub = "Compose";
+	else if (g_app.screen == SCREEN_SETTINGS) sub = "Account Settings";
+	else if (g_app.folder_count > 0) sub = g_app.folders[g_app.selected_folder].name;
+	ui_draw_text(118, 13, 16, COL_MUTED, sub, 240);
+
+	NetTlsStatus st;
+	net_tls_get_status(&st);
+	int tls_ok = (st.ca_found && st.ca_loaded_count > 0);
+	UiColor pill_col = tls_ok ? (UiColor){ 20, 75, 52, 255 } : (UiColor){ 105, 28, 38, 255 };
+	UiColor pill_bdr = tls_ok ? COL_GREEN : COL_RED;
+
+	ui_fill_rect(690, 8, 256, 28, pill_col);
+	ui_draw_rect(690, 8, 256, 28, pill_bdr);
+
+	char pill_txt[64];
+	if (tls_ok)
+		snprintf(pill_txt, sizeof(pill_txt), "iTLS OK (%d CAs) [Sel]", st.ca_loaded_count);
+	else
+		snprintf(pill_txt, sizeof(pill_txt), "NO iTLS CA STORE [Sel]");
+	ui_draw_text(700, 14, 14, COL_TEXT, pill_txt, 236);
+}
+
+static void render_inbox(void)
+{
+	/* Left sidebar */
+	ui_fill_rect(0, 44, 210, VITA_SCREEN_H - 44, COL_PANEL_ALT);
+	ui_fill_rect(209, 44, 1, VITA_SCREEN_H - 44, COL_BORDER);
+
+	draw_button(14, 56, 182, 36, "[Square] Compose", 0, (UiColor){ 36, 98, 176, 255 });
+	draw_button(14, 100, 182, 36, "[Start] Settings", 0, COL_PANEL);
+
+	ui_draw_text(14, 142, 13, COL_MUTED, "FOLDERS (L/R)", 182);
+	for (int i = 0; i < g_app.folder_count && i < 8; i++) {
+		int y = 162 + i * 38;
+		int sel = (i == g_app.selected_folder);
+		ui_fill_rect(14, y, 182, 34, sel ? COL_SEL : COL_PANEL);
+		ui_draw_rect(14, y, 182, 34, sel ? COL_ACCENT : COL_BORDER);
+		ui_draw_text(24, y + 9, 15, COL_TEXT, g_app.folders[i].name, 162);
+	}
+
+	/* Email list */
+	if (g_app.header_count == 0) {
+		ui_draw_text(250, 220, 18, COL_MUTED,
+		             g_app.busy ? "Syncing mailbox..." : "No messages. Press [Triangle] to refresh.",
+		             650);
+	} else {
+		for (int row = 0; row < 8; row++) {
+			int idx = g_app.list_scroll + row;
+			if (idx >= g_app.header_count)
+				break;
+			const ImapHeader *h = &g_app.headers[idx];
+			int y = 54 + row * 56;
+			int sel = (idx == g_app.selected_msg);
+
+			ui_fill_rect(218, y, 728, 52, sel ? COL_SEL : COL_PANEL);
+			ui_draw_rect(218, y, 728, 52, sel ? COL_ACCENT : COL_BORDER);
+
+			if (!h->seen)
+				ui_fill_circle_dot(232, y + 26, 5, COL_ACCENT);
+
+			ui_draw_text(246, y + 7, 15, h->seen ? COL_MUTED : COL_TEXT, h->from, 430);
+			ui_draw_text(690, y + 7, 13, COL_MUTED, h->date, 244);
+			ui_draw_text(246, y + 28, 16, COL_TEXT, h->subject, 688);
+		}
+	}
+}
+
+static void render_reader(void)
+{
+	ui_fill_rect(16, 54, 928, 86, COL_PANEL);
+	ui_draw_rect(16, 54, 928, 86, COL_BORDER);
+
+	ui_draw_text(28, 62, 18, COL_TEXT, g_app.open_msg.subject, 900);
+	char from_line[300];
+	snprintf(from_line, sizeof(from_line), "From: %s", g_app.open_msg.from);
+	ui_draw_text(28, 88, 14, COL_ACCENT, from_line, 620);
+	ui_draw_text(660, 88, 13, COL_MUTED, g_app.open_msg.date, 270);
+
+	if (g_app.open_msg.attachments[0] != '\0') {
+		char att[560];
+		snprintf(att, sizeof(att), "Attachments: %s", g_app.open_msg.attachments);
+		ui_draw_text(28, 112, 13, COL_MUTED, att, 900);
+	}
+
+	ui_fill_rect(16, 148, 928, 330, COL_PANEL_ALT);
+	ui_draw_rect(16, 148, 928, 330, COL_BORDER);
+
+	g_app.reader_total_h = ui_draw_wrapped_text(28, 158, 904, 310, 16, COL_TEXT,
+	                                            g_app.open_msg.body ? g_app.open_msg.body : "",
+	                                            g_app.reader_scroll);
+
+	draw_button(20, 488, 130, 38, "[Sq] Reply", 0, (UiColor){ 36, 98, 176, 255 });
+	draw_button(165, 488, 170, 38, "[Tri] Mark Unread", 0, COL_PANEL);
+	draw_button(350, 488, 130, 38, "[X] Delete", 0, (UiColor){ 120, 34, 46, 255 });
+	draw_button(810, 488, 130, 38, "[O] Back", 0, COL_PANEL);
+}
+
+static void render_compose(void)
+{
+	ui_draw_text(40, 54, 14, COL_MUTED, "Tap any field or press [Cross] to type with Vita Keyboard", 880);
+
+	char buf[300];
+	snprintf(buf, sizeof(buf), "To: %s", g_app.cmp_to[0] ? g_app.cmp_to : "(tap to enter)");
+	draw_button(40, 74, 880, 40, buf, g_app.cmp_focus == 0, COL_PANEL);
+
+	snprintf(buf, sizeof(buf), "Subject: %s", g_app.cmp_subject[0] ? g_app.cmp_subject : "(tap to enter)");
+	draw_button(40, 126, 880, 40, buf, g_app.cmp_focus == 1, COL_PANEL);
+
+	ui_fill_rect(40, 178, 880, 270, COL_PANEL);
+	ui_draw_rect(40, 178, 880, 270, g_app.cmp_focus == 2 ? COL_ACCENT : COL_BORDER);
+	ui_draw_wrapped_text(52, 188, 856, 250, 16,
+	                     g_app.cmp_body[0] ? COL_TEXT : COL_MUTED,
+	                     g_app.cmp_body[0] ? g_app.cmp_body : "(Tap or press [Cross] to write message body...)",
+	                     0);
+
+	draw_button(40, 468, 180, 42, "Send Email", g_app.cmp_focus == 3, (UiColor){ 36, 120, 82, 255 });
+	draw_button(240, 468, 180, 42, "Cancel [O]", g_app.cmp_focus == 4, COL_PANEL);
+}
+
+static void render_settings(void)
+{
+	char rows[9][256];
+	snprintf(rows[0], sizeof(rows[0]), "Preset: %s  (tap / [Cross] to cycle)", config_preset_name(g_app.edit_cfg.preset));
+	snprintf(rows[1], sizeof(rows[1]), "Email: %s", g_app.edit_cfg.email[0] ? g_app.edit_cfg.email : "(not set)");
+	snprintf(rows[2], sizeof(rows[2]), "Password: %s", g_app.edit_cfg.password[0] ? "************" : "(not set)");
+	snprintf(rows[3], sizeof(rows[3]), "IMAP Host: %s", g_app.edit_cfg.imap_host);
+	snprintf(rows[4], sizeof(rows[4]), "IMAP Port: %u", (unsigned)g_app.edit_cfg.imap_port);
+	snprintf(rows[5], sizeof(rows[5]), "IMAP Security: %s", g_app.edit_cfg.imap_starttls ? "STARTTLS" : "Implicit TLS (SSL)");
+	snprintf(rows[6], sizeof(rows[6]), "SMTP Host: %s", g_app.edit_cfg.smtp_host);
+	snprintf(rows[7], sizeof(rows[7]), "SMTP Port: %u", (unsigned)g_app.edit_cfg.smtp_port);
+	snprintf(rows[8], sizeof(rows[8]), "SMTP Security: %s", g_app.edit_cfg.smtp_starttls ? "STARTTLS" : "Implicit TLS (SSL)");
+
+	for (int i = 0; i < 9; i++) {
+		draw_button(40, 62 + i * 42, 880, 36, rows[i], g_app.set_focus == i, COL_PANEL);
+	}
+
+	draw_button(40, 456, 220, 42, "Save & Connect", g_app.set_focus == 9, (UiColor){ 36, 120, 82, 255 });
+	draw_button(280, 456, 160, 42, "Back [O]", g_app.set_focus == 10, COL_PANEL);
+}
+
+static void render_tls_modal(void)
+{
+	ui_fill_rect(0, 0, VITA_SCREEN_W, VITA_SCREEN_H, (UiColor){ 0, 0, 0, 175 });
+	ui_fill_rect(140, 100, 680, 330, COL_PANEL);
+	ui_draw_rect(140, 100, 680, 330, COL_ACCENT);
+
+	NetTlsStatus st;
+	net_tls_get_status(&st);
+
+	ui_draw_text(165, 118, 20, COL_TEXT, "TLS & iTLS-Enso Certificate Store", 630);
+
+	char line[320];
+	snprintf(line, sizeof(line), "CA Store Path: %s", st.ca_path);
+	ui_draw_text(165, 158, 15, COL_MUTED, line, 630);
+
+	snprintf(line, sizeof(line), "Status: %s",
+	         (st.ca_found && st.ca_loaded_count > 0)
+	             ? "VALID (Non-expired CA bundle loaded)"
+	             : "MISSING OR EMPTY - iTLS-Enso REQUIRED!");
+	ui_draw_text(165, 188, 16, (st.ca_found && st.ca_loaded_count > 0) ? COL_GREEN : COL_RED, line, 630);
+
+	snprintf(line, sizeof(line), "Certificates Loaded: %d   |   Skipped: %d   |   Network: %s",
+	         st.ca_loaded_count, st.ca_skipped_count,
+	         net_tls_is_online() ? "Connected" : "Offline");
+	ui_draw_text(165, 220, 15, COL_TEXT, line, 630);
+
+	ui_draw_wrapped_text(165, 255, 630, 90, 14, COL_MUTED,
+	                     "VitaMail strictly verifies IMAP & SMTP TLS certificates against "
+	                     "vs0:/data/external/cert/CA_LIST.cer. If your Vita's certificate store "
+	                     "is missing or expired, install iTLS-Enso (v3.2.1+) and choose "
+	                     "\"Install the full iTLS package\" or \"Install the iTLS CA certs\".",
+	                     0);
+
+	draw_button(290, 360, 180, 38, "[X] Re-check CA", 1, (UiColor){ 36, 98, 176, 255 });
+	draw_button(490, 360, 180, 38, "[O] Close", 0, COL_PANEL_ALT);
+}
+
+void app_render(void)
+{
+	ui_clear(COL_BG);
+	render_top_bar();
+
+	SDL_LockMutex(g_app.lock);
+	if (g_app.screen == SCREEN_INBOX) render_inbox();
+	else if (g_app.screen == SCREEN_READER) render_reader();
+	else if (g_app.screen == SCREEN_COMPOSE) render_compose();
+	else if (g_app.screen == SCREEN_SETTINGS) render_settings();
+
+	/* Bottom status bar */
+	if (g_app.status_msg[0] != '\0') {
+		ui_fill_rect(0, VITA_SCREEN_H - 28, VITA_SCREEN_W, 28,
+		             g_app.status_is_err ? (UiColor){ 105, 28, 38, 240 } : (UiColor){ 24, 34, 52, 240 });
+		ui_draw_text(14, VITA_SCREEN_H - 22, 14, COL_TEXT, g_app.status_msg, VITA_SCREEN_W - 28);
+	}
+	SDL_UnlockMutex(g_app.lock);
+
+	if (g_app.show_tls_modal)
+		render_tls_modal();
+}
